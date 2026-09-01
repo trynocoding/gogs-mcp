@@ -113,12 +113,11 @@ The command prints machine-readable JSON without credentials. A successful resul
 Build the binary and register it as a user-scoped stdio server.
 
 ```bash
-claude mcp add \
+claude mcp add gogs \
   --scope user \
   --transport stdio \
   --env GOGS_BASE_URL=https://gogs.internal.example/ \
   --env GOGS_TOKEN_FILE="$HOME/.config/gogs-mcp/token" \
-  gogs \
   -- /absolute/path/to/gogs-mcp/.bin/gogs-mcp serve
 ```
 

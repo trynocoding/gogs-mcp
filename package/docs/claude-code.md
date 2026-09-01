@@ -7,12 +7,11 @@ every project.
 ## Register the server
 
 ```bash
-claude mcp add \
+claude mcp add gogs \
   --scope user \
   --transport stdio \
   --env GOGS_BASE_URL="https://gogs.internal.example/" \
   --env GOGS_TOKEN_FILE="$HOME/.config/gogs-mcp/token" \
-  gogs \
   -- "$HOME/.local/bin/gogs-mcp" serve
 ```
 

@@ -10,13 +10,12 @@ Point `GOGS_CA_FILE` at a PEM file that contains the certificate chain of
 your company CA:
 
 ```bash
-claude mcp add \
+claude mcp add gogs \
   --scope user \
   --transport stdio \
   --env GOGS_BASE_URL="https://gogs.internal.example/" \
   --env GOGS_TOKEN_FILE="$HOME/.config/gogs-mcp/token" \
   --env GOGS_CA_FILE="$HOME/.config/gogs-mcp/company-ca.pem" \
-  gogs \
   -- "$HOME/.local/bin/gogs-mcp" serve
 ```
 
@@ -44,13 +43,12 @@ applies to gogs-mcp as well. To set a proxy only for the server, add it to
 the `claude mcp add` options:
 
 ```bash
-claude mcp add \
+claude mcp add gogs \
   --scope user \
   --transport stdio \
   --env HTTPS_PROXY="http://proxy.internal.example:3128" \
   --env NO_PROXY="gogs.internal.example" \
-  ... (the GOGS_ variables from claude-code.md)
-  gogs \
+  ... (the GOGS_ variables from claude-code.md) \
   -- "$HOME/.local/bin/gogs-mcp" serve
 ```
 
