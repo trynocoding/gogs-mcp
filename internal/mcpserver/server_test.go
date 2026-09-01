@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"gogs-mcp/internal/gogs"
+	"gogs-mcp/internal/snapshot"
 
+	cockroacherrors "github.com/cockroachdb/errors"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,6 +19,7 @@ import (
 type fakeClient struct {
 	user             gogs.User
 	userErr          error
+	userCalls        int
 	repositories     []gogs.Repository
 	listErr          error
 	repository       gogs.Repository
@@ -46,9 +49,17 @@ type fakeClient struct {
 	commitCalls      int
 	commit           gogs.Commit
 	commitSHA        string
+	resolvedSHA      string
+	resolveErr       error
+	resolveCalls     int
+	resolveRef       string
+	archiveCalls     int
+	archiveSHA       string
+	archiveBody      func() (io.ReadCloser, error)
 }
 
 func (c *fakeClient) GetAuthenticatedUser(context.Context) (gogs.User, error) {
+	c.userCalls++
 	return c.user, c.userErr
 }
 
@@ -101,6 +112,21 @@ func (c *fakeClient) GetCommit(_ context.Context, _, _, sha string) (gogs.Commit
 	return c.commit, c.commitErr
 }
 
+func (c *fakeClient) ResolveCommitSHA(_ context.Context, _, _, ref string) (string, error) {
+	c.resolveCalls++
+	c.resolveRef = ref
+	return c.resolvedSHA, c.resolveErr
+}
+
+func (c *fakeClient) DownloadArchive(_ context.Context, _, _, sha string) (io.ReadCloser, error) {
+	c.archiveCalls++
+	c.archiveSHA = sha
+	if c.archiveBody != nil {
+		return c.archiveBody()
+	}
+	return nil, cockroacherrors.New("unexpected archive download")
+}
+
 func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 	session := connectTestClient(t, &fakeClient{user: gogs.User{
 		ID:       42,
@@ -111,7 +137,7 @@ func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 
 	list, err := session.ListTools(context.Background(), nil)
 	require.NoError(t, err)
-	require.Len(t, list.Tools, 10)
+	require.Len(t, list.Tools, 11)
 	tool := findTool(t, list.Tools, "get_authenticated_user")
 	require.NotNil(t, tool.Annotations)
 	assert.True(t, tool.Annotations.ReadOnlyHint)
@@ -191,9 +217,14 @@ func TestAuthenticatedUserToolRejectsUnknownInput(t *testing.T) {
 
 func connectTestClient(t *testing.T, serverClient Client) *mcp.ClientSession {
 	t.Helper()
+	return connectTestClientWithSnapshots(t, serverClient, nil)
+}
+
+func connectTestClientWithSnapshots(t *testing.T, serverClient Client, snapshots *snapshot.Manager) *mcp.ClientSession {
+	t.Helper()
 	ctx := context.Background()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	server := New(serverClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := New(serverClient, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	serverSession, err := server.MCP().Connect(ctx, serverTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {

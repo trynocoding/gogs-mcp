@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gogs-mcp/internal/gogs"
+	"gogs-mcp/internal/snapshot"
 	"gogs-mcp/internal/version"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -25,6 +26,8 @@ type Client interface {
 	GetBranch(context.Context, string, string, string) (gogs.Branch, error)
 	ListCommits(context.Context, string, string, int) ([]gogs.Commit, error)
 	GetCommit(context.Context, string, string, string) (gogs.Commit, error)
+	ResolveCommitSHA(context.Context, string, string, string) (string, error)
+	DownloadArchive(context.Context, string, string, string) (io.ReadCloser, error)
 }
 
 type Server struct {
@@ -35,7 +38,9 @@ type emptyInput struct{}
 
 var fallbackRequestID atomic.Uint64
 
-func New(client Client, logger *slog.Logger) *Server {
+// New assembles the MCP server. The snapshot manager enables search_code and
+// may be nil, in which case search_code reports that search is unavailable.
+func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger) *Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "gogs-mcp", Version: version.Version},
 		&mcp.ServerOptions{
@@ -87,6 +92,7 @@ func New(client Client, logger *slog.Logger) *Server {
 	registerRepositoryTools(server, client)
 	registerContentTools(server, client)
 	registerGitTools(server, client)
+	registerSearchTools(server, client, snapshots, &identityCache{})
 
 	return &Server{mcp: server}
 }

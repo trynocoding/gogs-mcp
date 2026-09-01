@@ -5,5 +5,6 @@
   "allow_insecure_http": false,
   "write_enabled": false,
   "http_timeout": "30s",
-  "log_level": "info"
+  "log_level": "info",
+  "cache_dir": "/home/user/.cache/gogs-mcp"
 }

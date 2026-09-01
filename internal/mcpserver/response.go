@@ -11,6 +11,7 @@ type ResponseMeta struct {
 	Truncated     bool     `json:"truncated"`
 	NextPage      *int     `json:"next_page,omitempty"`
 	NextStartLine *int     `json:"next_start_line,omitempty"`
+	CacheHit      bool     `json:"cache_hit,omitempty"`
 	Warnings      []string `json:"warnings,omitempty"`
 }
 
@@ -124,4 +125,25 @@ type Commit struct {
 	Author     CommitPerson `json:"author"`
 	Committer  CommitPerson `json:"committer"`
 	ParentSHAs []string     `json:"parent_shas,omitempty"`
+}
+
+type SearchContextLine struct {
+	Line int    `json:"line"`
+	Text string `json:"text"`
+}
+
+type SearchMatch struct {
+	Path     string              `json:"path"`
+	Line     int                 `json:"line"`
+	Column   int                 `json:"column"`
+	LineText string              `json:"line_text"`
+	Context  []SearchContextLine `json:"context"`
+}
+
+type SearchPage struct {
+	Query     string        `json:"query"`
+	Ref       string        `json:"ref"`
+	CommitSHA string        `json:"commit_sha"`
+	Mode      string        `json:"mode"`
+	Matches   []SearchMatch `json:"matches"`
 }

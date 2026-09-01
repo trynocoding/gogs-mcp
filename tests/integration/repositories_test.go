@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"gogs-mcp/internal/gogs"
 	"gogs-mcp/internal/mcpserver"
+	"gogs-mcp/internal/snapshot"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -139,6 +141,13 @@ func TestRepositoryToolsUseGogsV0142Contracts(t *testing.T) {
 
 func connect(t *testing.T, apiRoot, token string) *mcp.ClientSession {
 	t.Helper()
+	return connectWithSnapshotCache(t, apiRoot, token, "")
+}
+
+// connectWithSnapshotCache wires an in-memory server against a real snapshot
+// manager rooted at cacheDir, mirroring the production assembly.
+func connectWithSnapshotCache(t *testing.T, apiRoot, token, cacheDir string) *mcp.ClientSession {
+	t.Helper()
 	parsed, err := url.Parse(apiRoot)
 	require.NoError(t, err)
 	client, err := gogs.NewClient(gogs.Options{
@@ -149,8 +158,16 @@ func connect(t *testing.T, apiRoot, token string) *mcp.ClientSession {
 	})
 	require.NoError(t, err)
 
+	var snapshots *snapshot.Manager
+	if cacheDir != "" {
+		instance := *parsed
+		instance.Path = strings.TrimSuffix(parsed.Path, "/api/v1/")
+		snapshots, err = snapshot.NewManager(cacheDir, instance.String(), snapshot.DefaultLimits())
+		require.NoError(t, err)
+	}
+
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	server := mcpserver.New(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := mcpserver.New(client, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	serverSession, err := server.MCP().Connect(context.Background(), serverTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {

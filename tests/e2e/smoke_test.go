@@ -503,18 +503,29 @@ func callAuthenticatedUser(t *testing.T, projectRoot, baseURL, token string) (*m
 
 func useMCPClient(t *testing.T, projectRoot, baseURL, token string, action func(*mcp.ClientSession)) []byte {
 	t.Helper()
+	return useMCPClientWithCache(t, projectRoot, baseURL, token, "", action)
+}
+
+// useMCPClientWithCache starts the stdio server with an explicit snapshot cache
+// directory. An empty cacheDir keeps the default user cache location.
+func useMCPClientWithCache(t *testing.T, projectRoot, baseURL, token, cacheDir string, action func(*mcp.ClientSession)) []byte {
+	t.Helper()
 	var stderr bytes.Buffer
 	defer func() {
 		assertNoSecrets(t, stderr.Bytes(), token)
 	}()
 
 	command := exec.Command(filepath.Join(projectRoot, ".bin", "gogs-mcp"), "serve")
-	command.Env = append(filteredEnvironment(os.Environ()),
+	environment := append(filteredEnvironment(os.Environ()),
 		"GOGS_BASE_URL="+baseURL,
 		"GOGS_TOKEN="+token,
 		"GOGS_ALLOW_INSECURE_HTTP=true",
 		"NO_PROXY=127.0.0.1,localhost",
 	)
+	if cacheDir != "" {
+		environment = append(environment, "GOGS_MCP_CACHE_DIR="+cacheDir)
+	}
+	command.Env = environment
 	command.Stderr = &stderr
 
 	client := mcp.NewClient(&mcp.Implementation{
@@ -552,6 +563,7 @@ func useMCPClient(t *testing.T, projectRoot, baseURL, token string, action func(
 		"get_branch",
 		"list_commits",
 		"get_commit",
+		"search_code",
 	}, names)
 	action(session)
 	require.NoError(t, session.Close())

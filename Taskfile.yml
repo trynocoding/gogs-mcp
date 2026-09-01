@@ -46,6 +46,12 @@ tasks:
     cmds:
       - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestGit$'
 
+  test:e2e:search:
+    desc: Run literal code search tests against isolated Gogs v0.14.2.
+    deps: [build]
+    cmds:
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestSearch$'
+
   lint:
     desc: Run all configured linters.
     cmds:

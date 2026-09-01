@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,8 @@ type Config struct {
 	WriteEnabled      bool
 	HTTPTimeout       time.Duration
 	LogLevel          string
+	// CacheDir overrides the snapshot cache root. It must be an absolute path.
+	CacheDir string
 }
 
 type fileConfig struct {
@@ -38,6 +41,7 @@ type fileConfig struct {
 	AllowInsecureHTTP *bool  `json:"allow_insecure_http"`
 	WriteEnabled      *bool  `json:"write_enabled"`
 	HTTPTimeout       string `json:"http_timeout"`
+	CacheDir          string `json:"cache_dir"`
 	LogLevel          string `json:"log_level"`
 }
 
@@ -151,6 +155,9 @@ func applyFile(cfg *Config, values fileConfig) error {
 	if values.LogLevel != "" {
 		cfg.LogLevel = values.LogLevel
 	}
+	if values.CacheDir != "" {
+		cfg.CacheDir = values.CacheDir
+	}
 	return nil
 }
 
@@ -197,6 +204,9 @@ func applyEnvironment(cfg *Config, lookup LookupEnv) error {
 	}
 	if value, ok := lookup("GOGS_LOG_LEVEL"); ok {
 		cfg.LogLevel = value
+	}
+	if value, ok := lookup("GOGS_MCP_CACHE_DIR"); ok {
+		cfg.CacheDir = value
 	}
 	return nil
 }
@@ -265,6 +275,9 @@ func validate(cfg *Config) error {
 		if !info.Mode().IsRegular() {
 			return errors.New("GOGS_CA_FILE must be a regular file")
 		}
+	}
+	if cfg.CacheDir != "" && !filepath.IsAbs(cfg.CacheDir) {
+		return errors.New("GOGS_MCP_CACHE_DIR must be an absolute path")
 	}
 	return nil
 }

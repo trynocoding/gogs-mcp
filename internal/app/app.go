@@ -6,12 +6,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 
 	"gogs-mcp/internal/config"
 	"gogs-mcp/internal/gogs"
 	"gogs-mcp/internal/mcpserver"
 	"gogs-mcp/internal/securelog"
+	"gogs-mcp/internal/snapshot"
 	"gogs-mcp/internal/version"
 
 	"github.com/cockroachdb/errors"
@@ -107,7 +110,22 @@ func runServe(
 		return exitInternal
 	}
 
-	server := mcpserver.New(client, logger)
+	cacheDir := cfg.CacheDir
+	if cacheDir == "" {
+		userCache, err := os.UserCacheDir()
+		if err != nil {
+			logger.Error("Could not determine the snapshot cache directory.", "error", err)
+			return exitConfig
+		}
+		cacheDir = filepath.Join(userCache, "gogs-mcp")
+	}
+	snapshots, err := snapshot.NewManager(cacheDir, cfg.BaseURL.String(), snapshot.DefaultLimits())
+	if err != nil {
+		logger.Error("Could not initialize the snapshot cache.", "error", err)
+		return exitConfig
+	}
+
+	server := mcpserver.New(client, snapshots, logger)
 	if err := server.Run(ctx, io.NopCloser(stdin), nopWriteCloser{stdout}); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("The MCP server stopped unexpectedly.", "error", err)
 		return exitInternal
