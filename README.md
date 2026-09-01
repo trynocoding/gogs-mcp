@@ -14,7 +14,7 @@ Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tool
 | `get_branch` | Return a single branch and its head commit SHA. Branch names may contain slashes. |
 | `list_commits` | Return the most recent commits of the default branch with the first line of each message. |
 | `get_commit` | Return a single commit by SHA with author, committer, message subject, parents, and web URL. |
-| `search_code` | Search for a case-sensitive literal string across the files of an immutable commit snapshot. |
+| `search_code` | Search file content of an immutable commit snapshot with a literal or regular-expression query, bounded by result count, file size, and timeout. |
 
 ## Requirements
 
@@ -53,7 +53,11 @@ Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The reposi
 
 `list_commits` is fixed to the default branch because Gogs v0.14.2 always starts at `HEAD` and supports only a page size. It accepts at most 100 commits, shortens messages longer than 200 characters, and sets `meta.truncated` with a warning. Gogs v0.14.2 only exposes the first line of a commit message, so `get_commit` returns that same line untruncated. `get_commit` accepts any single-segment revision Git understands (full or short SHA, tag, branch name without slashes); unknown revisions surface the Gogs response verbatim, which is a not-found error for revisions `git rev-parse` rejects and a server error for well-formed SHAs that do not exist.
 
-`search_code` accepts a case-sensitive literal query of at most 1000 characters and an optional `ref` containing a branch, tag, or commit SHA. The ref is resolved to a full commit SHA (branch first, then tag, then revision), and the server downloads the tar.gz archive of that exact commit from Gogs, which cannot change while the search runs. The archive is extracted into a per-user, per-repository, per-commit snapshot cache owned only by the current user (directories `0700`, files `0600`), and archives are unpacked strictly inside the cache root: symlinks, hardlinks, and device entries are skipped, and path traversal is rejected. Up to 50 matches are returned with file path, 1-based line and byte column, the matching line, and two lines of context before and after; oversized output sets `meta.truncated` with a warning. Repeat searches for the same commit set `meta.cache_hit` and do not contact Gogs again.
+`search_code` accepts a query of at most 1000 characters, an optional `ref` containing a branch, tag, or commit SHA, and optional bounds. The query is a case-sensitive literal string by default; `mode: "regex"` interprets it as a regular expression (RE2) and `case_sensitive: false` folds case. Invalid queries and globs are rejected with `INVALID_ARGUMENT` before the ref is resolved or any archive is downloaded. The ref is resolved to a full commit SHA (branch first, then tag, then revision), and the server downloads the tar.gz archive of that exact commit from Gogs, which cannot change while the search runs. The archive is extracted into a per-user, per-repository, per-commit snapshot cache owned only by the current user (directories `0700`, files `0600`), and archives are unpacked strictly inside the cache root: symlinks, hardlinks, and device entries are skipped, and path traversal is rejected.
+
+Results are bounded and every bound is observable. Up to 50 matches are returned (at most 500 via `max_results`) with file path, 1-based line and byte column, the matching line, and two lines of context before and after (`context_lines`, 0 through 10). Reaching `max_results`, the 64 KiB structured-output limit, or the search time limit (`timeout_seconds`, 1 through 300) sets `meta.truncated` with a warning; a timeout with partial results returns them, and a timeout without results returns `SEARCH_TIMEOUT`. The `include` and `exclude` glob patterns restrict or skip paths, and always exclude `.git`. Binary files (a NUL byte or invalid UTF-8) and files larger than 1 MiB (`GOGS_MCP_MAX_FILE_BYTES`) are skipped and reported in warnings. Repeat searches for the same commit set `meta.cache_hit` and do not contact Gogs again.
+
+The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) are expired and the least recently used snapshots are removed when the per-user cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`), before a new download starts. Snapshots held by an active search are never evicted; when no room can be made, the search fails with `CACHE_CAPACITY_EXCEEDED` instead of downloading. `gogs-mcp cache clean` removes the authenticated user's snapshot cache and `gogs-mcp cache clean --all` removes every verified cache root; configuration, tokens, and anything outside the cache root are never touched.
 
 ## Configure credentials
 
@@ -111,6 +115,10 @@ Environment variables override file values.
 | `GOGS_CA_FILE` | System trust store. | Additional PEM CA certificate file. |
 | `GOGS_ALLOW_INSECURE_HTTP` | `false`. | Explicitly permits plain HTTP. |
 | `GOGS_MCP_CACHE_DIR` | OS user cache directory. | Absolute path of the snapshot cache root for `search_code`. |
+| `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`. | Snapshot cache size per Gogs user before least-recently-used eviction. |
+| `GOGS_MCP_CACHE_TTL` | `24h`. | How long a snapshot may stay untouched before it expires. |
+| `GOGS_MCP_SEARCH_TIMEOUT` | `30s`. | Default search time limit for `search_code`, at most `5m`. |
+| `GOGS_MCP_MAX_FILE_BYTES` | `1048576`. | Files larger than this are skipped by `search_code`. |
 | `GOGS_MCP_WRITE_ENABLED` | `false`. | Reserved for optional write tools in later deliveries. |
 | `GOGS_HTTP_TIMEOUT` | `30s`. | HTTP request timeout. |
 | `GOGS_LOG_LEVEL` | `info`. | `debug`, `info`, `warn`, or `error`. |
@@ -122,6 +130,7 @@ The standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables are honored.
 ```text
 gogs-mcp serve [--config PATH]
 gogs-mcp verify [--config PATH]
+gogs-mcp cache clean [--config PATH] [--all]
 gogs-mcp version [--json]
 ```
 

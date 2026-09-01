@@ -66,6 +66,8 @@ func Run(
 		return runServe(ctx, args[1:], stdin, stdout, stderr, lookup)
 	case "verify":
 		return runVerify(ctx, args[1:], stdout, stderr, lookup)
+	case "cache":
+		return runCache(ctx, args[1:], stdout, stderr, lookup)
 	case "version":
 		return runVersion(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
@@ -110,26 +112,100 @@ func runServe(
 		return exitInternal
 	}
 
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		userCache, err := os.UserCacheDir()
-		if err != nil {
-			logger.Error("Could not determine the snapshot cache directory.", "error", err)
-			return exitConfig
-		}
-		cacheDir = filepath.Join(userCache, "gogs-mcp")
-	}
-	snapshots, err := snapshot.NewManager(cacheDir, cfg.BaseURL.String(), snapshot.DefaultLimits())
+	snapshots, err := cacheManagerFor(cfg)
 	if err != nil {
 		logger.Error("Could not initialize the snapshot cache.", "error", err)
 		return exitConfig
 	}
 
-	server := mcpserver.New(client, snapshots, logger)
+	server := mcpserver.New(client, snapshots, logger, mcpserver.SearchDefaults{
+		Timeout:      cfg.SearchTimeout,
+		MaxFileBytes: cfg.MaxFileBytes,
+	})
 	if err := server.Run(ctx, io.NopCloser(stdin), nopWriteCloser{stdout}); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("The MCP server stopped unexpectedly.", "error", err)
 		return exitInternal
 	}
+	return exitOK
+}
+
+// cacheManagerFor builds a snapshot manager for cache maintenance commands.
+func cacheManagerFor(cfg config.Config) (*snapshot.Manager, error) {
+	cacheDir := cfg.CacheDir
+	if cacheDir == "" {
+		userCache, err := os.UserCacheDir()
+		if err != nil {
+			return nil, err
+		}
+		cacheDir = filepath.Join(userCache, "gogs-mcp")
+	}
+	return snapshot.NewManager(cacheDir, cfg.BaseURL.String(), snapshot.DefaultLimits(), snapshot.Eviction{
+		MaxBytes: cfg.CacheMaxBytes,
+		TTL:      cfg.CacheTTL,
+	})
+}
+
+// runCache implements `cache clean`, which removes snapshot caches without
+// ever touching configuration, tokens, or anything outside the cache root.
+func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, lookup config.LookupEnv) int {
+	if len(args) == 0 || args[0] != "clean" {
+		writeText(stderr, "Usage: gogs-mcp cache clean [--config PATH] [--all].\n")
+		return exitConfig
+	}
+	flags := flag.NewFlagSet("cache clean", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "Read non-sensitive configuration from this JSON file.")
+	all := flags.Bool("all", false, "Remove every verified snapshot cache root.")
+	if err := flags.Parse(args[1:]); err != nil {
+		return exitConfig
+	}
+	if flags.NArg() != 0 {
+		writeText(stderr, "cache clean does not accept positional arguments.\n")
+		return exitConfig
+	}
+
+	cfg, err := config.Load(*configPath, lookup)
+	if err != nil {
+		writeText(stderr, "Configuration error: %s.\n", err)
+		return exitConfig
+	}
+	snapshots, err := cacheManagerFor(cfg)
+	if err != nil {
+		writeText(stderr, "Could not initialize the snapshot cache: %s.\n", err)
+		return exitConfig
+	}
+
+	if *all {
+		if err := snapshots.RemoveAll(); err != nil {
+			writeText(stderr, "Could not remove the snapshot caches: %s.\n", err)
+			return exitInternal
+		}
+		writeText(stdout, "Removed every snapshot cache for the verified cache roots.\n")
+		return exitOK
+	}
+
+	client, err := gogs.NewClient(gogs.Options{
+		APIRoot:   cfg.APIRoot(),
+		Token:     cfg.Token,
+		CAFile:    cfg.CAFile,
+		Timeout:   cfg.HTTPTimeout,
+		UserAgent: "gogs-mcp/" + version.Version,
+	})
+	if err != nil {
+		writeText(stderr, "Could not initialize the Gogs client: %s.\n", err)
+		return exitConfig
+	}
+	user, err := client.GetAuthenticatedUser(ctx)
+	if err != nil {
+		classified := gogs.AsError(err)
+		writeText(stderr, "Could not resolve the authenticated user: %s (%s).\n", classified.Message, classified.Code)
+		return exitConnection
+	}
+	if err := snapshots.RemoveUser(user.ID); err != nil {
+		writeText(stderr, "Could not remove the snapshot cache: %s.\n", err)
+		return exitInternal
+	}
+	writeText(stdout, "Removed the snapshot cache for user %s.\n", user.Username)
 	return exitOK
 }
 
@@ -247,7 +323,7 @@ func writeJSON(writer io.Writer, value any) {
 }
 
 func writeUsage(writer io.Writer) {
-	writeText(writer, "Usage: gogs-mcp <serve|verify|version> [options].\n")
+	writeText(writer, "Usage: gogs-mcp <serve|verify|cache|version> [options].\n")
 }
 
 func writeText(writer io.Writer, format string, arguments ...any) {

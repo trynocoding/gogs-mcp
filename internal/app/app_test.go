@@ -1,19 +1,24 @@
 package app
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"gogs-mcp/internal/config"
+	"gogs-mcp/internal/snapshot"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -221,4 +226,142 @@ func mapEnvironment(values map[string]string) config.LookupEnv {
 
 func emptyEnvironment(string) (string, bool) {
 	return "", false
+}
+
+// minimalArchive is a tiny Gogs-style archive for cache maintenance tests.
+func minimalArchive(t *testing.T) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := gzip.NewWriter(&buffer)
+	archive := tar.NewWriter(writer)
+	header := &tar.Header{Name: "repo-aaa/file.txt", Typeflag: tar.TypeReg, Size: int64(len("content\n"))}
+	require.NoError(t, archive.WriteHeader(header))
+	_, err := archive.Write([]byte("content\n"))
+	require.NoError(t, err)
+	require.NoError(t, archive.Close())
+	require.NoError(t, writer.Close())
+	return buffer.Bytes()
+}
+
+func seedSnapshotCache(t *testing.T, cacheRoot, baseURL string, userIDs ...int64) {
+	t.Helper()
+	manager, err := snapshot.NewManager(cacheRoot, baseURL, snapshot.DefaultLimits(), snapshot.DefaultEviction())
+	require.NoError(t, err)
+	for _, userID := range userIDs {
+		result, err := manager.Ensure(context.Background(), snapshot.Key{
+			UserID:    userID,
+			Owner:     "owner",
+			Repo:      "repo",
+			CommitSHA: strings.Repeat("a", 40),
+		}, func(context.Context) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(minimalArchive(t))), nil
+		})
+		require.NoError(t, err)
+		result.Release()
+	}
+}
+
+func TestCacheCleanRemovesCurrentUserCache(t *testing.T) {
+	const token = "clean-secret-token"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		assert.Equal(t, "token "+token, request.Header.Get("Authorization"))
+		_, err := fmt.Fprint(writer, `{"id":21,"username":"clean-user","full_name":"Clean User","email":"clean@example.test"}`)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	cacheRoot := t.TempDir()
+	seedSnapshotCache(t, cacheRoot, server.URL, 21, 22)
+
+	var stdout bytes.Buffer
+	exitCode := Run(context.Background(), []string{"cache", "clean"}, strings.NewReader(""), &stdout, &bytes.Buffer{}, mapEnvironment(map[string]string{
+		"GOGS_BASE_URL":            server.URL,
+		"GOGS_TOKEN":               token,
+		"GOGS_ALLOW_INSECURE_HTTP": "true",
+		"GOGS_MCP_CACHE_DIR":       cacheRoot,
+	}))
+	assert.Equal(t, exitOK, exitCode)
+	assert.Contains(t, stdout.String(), "clean-user")
+	assert.NotContains(t, stdout.String(), token)
+
+	instance := instanceRoot(t, cacheRoot)
+	remaining, err := os.ReadDir(instance)
+	require.NoError(t, err)
+	userDirs := make([]string, 0, len(remaining))
+	for _, entry := range remaining {
+		userDirs = append(userDirs, entry.Name())
+	}
+	assert.Equal(t, []string{"22"}, userDirs, "only the authenticated user's cache is removed")
+}
+
+func TestCacheCleanAllRemovesVerifiedRootsOnly(t *testing.T) {
+	cacheRoot := t.TempDir()
+	seedSnapshotCache(t, cacheRoot, "https://gogs.example.test/", 21)
+	require.NoError(t, os.WriteFile(filepath.Join(cacheRoot, "keep.txt"), []byte("keep"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheRoot, "tmp"), 0o700))
+	instance := instanceRoot(t, cacheRoot)
+
+	var stdout bytes.Buffer
+	exitCode := Run(context.Background(), []string{"cache", "clean", "--all"}, strings.NewReader(""), &stdout, &bytes.Buffer{}, mapEnvironment(map[string]string{
+		"GOGS_BASE_URL":            "https://gogs.example.test/",
+		"GOGS_TOKEN":               "clean-secret-token",
+		"GOGS_MCP_CACHE_DIR":       cacheRoot,
+		"GOGS_ALLOW_INSECURE_HTTP": "true",
+	}))
+	assert.Equal(t, exitOK, exitCode)
+
+	_, err := os.Stat(instance)
+	assert.True(t, os.IsNotExist(err), "the verified instance root must be removed")
+	_, err = os.Stat(filepath.Join(cacheRoot, "keep.txt"))
+	require.NoError(t, err, "unrelated files must survive")
+	_, err = os.Stat(filepath.Join(cacheRoot, "tmp"))
+	assert.NoError(t, err, "the temporary area is not an instance root")
+}
+
+func TestCacheCleanRejectsBadInvocation(t *testing.T) {
+	environment := mapEnvironment(map[string]string{
+		"GOGS_BASE_URL":            "https://gogs.example.test/",
+		"GOGS_TOKEN":               "clean-secret-token",
+		"GOGS_ALLOW_INSECURE_HTTP": "true",
+	})
+	for _, args := range [][]string{
+		{"cache"},
+		{"cache", "scrub"},
+		{"cache", "clean", "extra"},
+	} {
+		exitCode := Run(context.Background(), args, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}, environment)
+		assert.Equal(t, exitConfig, exitCode, "%v", args)
+	}
+}
+
+func TestCacheCleanConnectionFailureExitsWithConnectionCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		http.Error(writer, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	var stderr bytes.Buffer
+	exitCode := Run(context.Background(), []string{"cache", "clean"}, strings.NewReader(""), &bytes.Buffer{}, &stderr, mapEnvironment(map[string]string{
+		"GOGS_BASE_URL":            server.URL,
+		"GOGS_TOKEN":               "clean-secret-token",
+		"GOGS_ALLOW_INSECURE_HTTP": "true",
+		"GOGS_MCP_CACHE_DIR":       t.TempDir(),
+	}))
+	assert.Equal(t, exitConnection, exitCode)
+	assert.NotContains(t, stderr.String(), "clean-secret-token")
+}
+
+// instanceRoot returns the single per-instance directory inside a seeded
+// cache root.
+func instanceRoot(t *testing.T, cacheRoot string) string {
+	t.Helper()
+	entries, err := os.ReadDir(cacheRoot)
+	require.NoError(t, err)
+	for _, entry := range entries {
+		if len(entry.Name()) == 64 && entry.IsDir() {
+			return filepath.Join(cacheRoot, entry.Name())
+		}
+	}
+	t.Fatal("no instance root found in the cache")
+	return ""
 }

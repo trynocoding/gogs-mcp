@@ -162,12 +162,12 @@ func connectWithSnapshotCache(t *testing.T, apiRoot, token, cacheDir string) *mc
 	if cacheDir != "" {
 		instance := *parsed
 		instance.Path = strings.TrimSuffix(parsed.Path, "/api/v1/")
-		snapshots, err = snapshot.NewManager(cacheDir, instance.String(), snapshot.DefaultLimits())
+		snapshots, err = snapshot.NewManager(cacheDir, instance.String(), snapshot.DefaultLimits(), snapshot.DefaultEviction())
 		require.NoError(t, err)
 	}
 
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	server := mcpserver.New(client, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := mcpserver.New(client, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)), mcpserver.DefaultSearchDefaults())
 	serverSession, err := server.MCP().Connect(context.Background(), serverTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {

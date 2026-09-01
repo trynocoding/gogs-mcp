@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -43,6 +44,23 @@ func DefaultLimits() Limits {
 	}
 }
 
+// Eviction controls how the manager keeps the cache bounded.
+type Eviction struct {
+	// MaxBytes is the total cache size above which least-recently-used
+	// snapshots are removed.
+	MaxBytes int64
+	// TTL is how long a snapshot may stay untouched before it expires.
+	TTL time.Duration
+}
+
+// DefaultEviction matches the documented cache limits.
+func DefaultEviction() Eviction {
+	return Eviction{
+		MaxBytes: 2 << 30,
+		TTL:      24 * time.Hour,
+	}
+}
+
 var (
 	// ErrArchiveTooLarge reports that the compressed archive exceeded the limit.
 	ErrArchiveTooLarge = errors.New("the compressed archive exceeds the size limit")
@@ -53,6 +71,9 @@ var (
 	// ErrUnsafeArchiveEntry reports an archive entry whose path cannot be
 	// materialized safely. Nothing from such an archive is published.
 	ErrUnsafeArchiveEntry = errors.New("the archive contains an unsafe entry path")
+	// ErrCacheCapacityExceeded reports that eviction could not make room for a
+	// new snapshot.
+	ErrCacheCapacityExceeded = errors.New("the snapshot cache cannot make room for a new snapshot")
 )
 
 // Key identifies one immutable snapshot. It is scoped to the normalized Gogs
@@ -79,23 +100,33 @@ type Metadata struct {
 	TotalBytes     int64     `json:"total_bytes"`
 }
 
-// Manager publishes snapshots atomically under a private cache root.
+// Manager publishes snapshots atomically under a private cache root and keeps
+// the cache bounded through TTL and LRU eviction.
 type Manager struct {
 	root     string
 	instance string
 	limits   Limits
+	eviction Eviction
+
+	// inUse tracks how many active searches hold each commit directory so
+	// that eviction never deletes a snapshot mid-read.
+	useMu sync.Mutex
+	inUse map[string]int
 }
 
 // NewManager returns a manager that isolates snapshots per instance and user
 // under the given cache root. The instance is any Gogs base URL.
-func NewManager(root, instance string, limits Limits) (*Manager, error) {
+func NewManager(root, instance string, limits Limits, eviction Eviction) (*Manager, error) {
 	if root == "" {
 		return nil, errors.New("cache root is required")
 	}
 	if instance == "" {
 		return nil, errors.New("Gogs instance is required")
 	}
-	return &Manager{root: root, instance: instance, limits: limits}, nil
+	if eviction.MaxBytes < 0 || eviction.TTL < 0 {
+		return nil, errors.New("eviction limits must not be negative")
+	}
+	return &Manager{root: root, instance: instance, limits: limits, eviction: eviction, inUse: make(map[string]int)}, nil
 }
 
 // Result describes a materialized snapshot.
@@ -107,24 +138,39 @@ type Result struct {
 	// SkippedEntries counts archive entries that were not materialized, such
 	// as symlinks, hardlinks, devices, FIFOs, and sockets.
 	SkippedEntries int
+	// Release marks the snapshot as no longer being read so that eviction may
+	// remove it. Callers must invoke it exactly once, typically deferred.
+	Release func()
 }
 
 // Ensure returns a fully extracted snapshot for the key, downloading and
 // extracting it only when no complete snapshot exists yet. The download is
 // only invoked on a cache miss. Publication is atomic: a snapshot directory
 // appears either complete or not at all, and concurrent callers converge on
-// the first published copy.
+// the first published copy. The returned snapshot is marked in use until
+// Result.Release is called, protecting it from eviction.
 func (m *Manager) Ensure(ctx context.Context, key Key, download func(context.Context) (io.ReadCloser, error)) (Result, error) {
 	commitDir, instanceHash, err := m.directory(key)
 	if err != nil {
 		return Result{}, err
 	}
 	final := filepath.Join(commitDir, "snapshot")
+	// Retain before the existence check so that a concurrent eviction in this
+	// process cannot remove the snapshot between the check and the first read.
+	release := m.retain(commitDir)
 	if info, err := os.Stat(final); err == nil && info.IsDir() {
-		return Result{Dir: final, CacheHit: true}, nil
+		m.touch(commitDir)
+		return Result{Dir: final, CacheHit: true, Release: release}, nil
 	}
+	release()
 
 	m.sweepStaleTemporaries()
+	if err := m.evictExpired(key.UserID); err != nil {
+		return Result{}, err
+	}
+	if err := m.enforceCapacity(key.UserID); err != nil {
+		return Result{}, err
+	}
 
 	temporaryRoot := filepath.Join(m.root, "tmp")
 	// The whole cache tree stays private to the current user.
@@ -158,12 +204,12 @@ func (m *Manager) Ensure(ctx context.Context, key Key, download func(context.Con
 		// Another process published the same snapshot first.
 		if info, statErr := os.Stat(final); statErr == nil && info.IsDir() {
 			_ = os.RemoveAll(temporary)
-			return Result{Dir: final, CacheHit: true, SkippedEntries: stats.SkippedEntries}, nil
+			return Result{Dir: final, CacheHit: true, SkippedEntries: stats.SkippedEntries, Release: m.retain(commitDir)}, nil
 		}
 		_ = os.RemoveAll(temporary)
 		return Result{}, errors.Wrap(err, "publish snapshot directory")
 	}
-	return Result{Dir: final, SkippedEntries: stats.SkippedEntries}, nil
+	return Result{Dir: final, SkippedEntries: stats.SkippedEntries, Release: m.retain(commitDir)}, nil
 }
 
 func writeMetadata(directory string, key Key, instanceHash string, stats extractionStats) error {

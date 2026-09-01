@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,7 +23,7 @@ const testInstance = "https://gogs.example.test/"
 
 func newTestManager(t *testing.T, limits Limits) *Manager {
 	t.Helper()
-	manager, err := NewManager(t.TempDir(), testInstance, limits)
+	manager, err := NewManager(t.TempDir(), testInstance, limits, DefaultEviction())
 	require.NoError(t, err)
 	return manager
 }
@@ -126,9 +127,9 @@ func TestEnsureReusesPublishedSnapshot(t *testing.T) {
 
 func TestEnsureIsolatesCacheKeys(t *testing.T) {
 	root := t.TempDir()
-	manager, err := NewManager(root, testInstance, DefaultLimits())
+	manager, err := NewManager(root, testInstance, DefaultLimits(), DefaultEviction())
 	require.NoError(t, err)
-	otherInstance, err := NewManager(root, "https://other.example.test/", DefaultLimits())
+	otherInstance, err := NewManager(root, "https://other.example.test/", DefaultLimits(), DefaultEviction())
 	require.NoError(t, err)
 
 	base := testKey()
@@ -224,7 +225,7 @@ func TestEnsureRejectsUnsafeArchivePaths(t *testing.T) {
 	}
 	for _, name := range unsafe {
 		t.Run(name, func(t *testing.T) {
-			manager, err := NewManager(root, testInstance, DefaultLimits())
+			manager, err := NewManager(root, testInstance, DefaultLimits(), DefaultEviction())
 			require.NoError(t, err)
 			_, err = manager.Ensure(context.Background(), testKey(), tarball(t, regularEntry(name, "evil\n")))
 			require.ErrorIs(t, err, ErrUnsafeArchiveEntry)
@@ -374,7 +375,7 @@ func TestCachePermissions(t *testing.T) {
 	// The cache root is nested below the temporary directory so that every
 	// asserted path is created by the manager itself.
 	root := filepath.Join(t.TempDir(), "cache")
-	manager, err := NewManager(root, testInstance, DefaultLimits())
+	manager, err := NewManager(root, testInstance, DefaultLimits(), DefaultEviction())
 	require.NoError(t, err)
 	result, err := manager.Ensure(context.Background(), testKey(), tarball(t,
 		regularEntry("top.txt", "content\n"),
@@ -490,10 +491,33 @@ func TestNormalizedInstanceHash(t *testing.T) {
 }
 
 func TestNewManagerRequiresRootAndInstance(t *testing.T) {
-	_, err := NewManager("", testInstance, DefaultLimits())
+	_, err := NewManager("", testInstance, DefaultLimits(), DefaultEviction())
 	require.Error(t, err)
-	_, err = NewManager(t.TempDir(), "", DefaultLimits())
+	_, err = NewManager(t.TempDir(), "", DefaultLimits(), DefaultEviction())
 	require.Error(t, err)
+	_, err = NewManager(t.TempDir(), testInstance, DefaultLimits(), Eviction{MaxBytes: -1, TTL: time.Hour})
+	require.Error(t, err)
+}
+
+// literalOptions returns default search options for a literal query.
+func literalOptions(query string) Options {
+	return Options{
+		Matcher:      literalMatcher(query),
+		ContextLines: DefaultContextLines,
+		MaxResults:   DefaultMaxResults,
+		MaxFileBytes: DefaultMaxFileBytes,
+	}
+}
+
+func searchFor(t *testing.T, root, query string, mutate func(*Options)) ([]Match, Stats) {
+	t.Helper()
+	options := literalOptions(query)
+	if mutate != nil {
+		mutate(&options)
+	}
+	matches, stats, err := Search(context.Background(), root, options)
+	require.NoError(t, err)
+	return matches, stats
 }
 
 func TestSearchFindsLiteralMatches(t *testing.T) {
@@ -501,8 +525,7 @@ func TestSearchFindsLiteralMatches(t *testing.T) {
 	writeSnapshotFile(t, root, "src/main.go", "package main\n\nfunc main() {\n\tprintln(\"needle here\")\n\tprintln(\"needle twice needle\")\n}\n")
 	writeSnapshotFile(t, root, "docs/readme.md", "no match here\n")
 
-	matches, err := Search(context.Background(), root, "needle")
-	require.NoError(t, err)
+	matches, _ := searchFor(t, root, "needle", nil)
 	require.Len(t, matches, 3)
 
 	assert.Equal(t, "src/main.go", matches[0].Path)
@@ -524,33 +547,61 @@ func TestSearchIsCaseSensitive(t *testing.T) {
 	root := t.TempDir()
 	writeSnapshotFile(t, root, "case.txt", "Needle\nneedle\nNEEDLE\n")
 
-	matches, err := Search(context.Background(), root, "needle")
-	require.NoError(t, err)
+	matches, _ := searchFor(t, root, "needle", nil)
 	require.Len(t, matches, 1)
 	assert.Equal(t, 2, matches[0].Line)
+}
+
+func TestSearchCaseInsensitiveLiteral(t *testing.T) {
+	root := t.TempDir()
+	writeSnapshotFile(t, root, "case.txt", "Needle\nneedle\nNEEDLE\n")
+
+	matches, _ := searchFor(t, root, "needle", func(options *Options) {
+		matcher, err := Compile(ModeLiteral, "needle", false)
+		require.NoError(t, err)
+		options.Matcher = matcher
+	})
+	require.Len(t, matches, 3)
+}
+
+func TestSearchRegexMode(t *testing.T) {
+	root := t.TempDir()
+	writeSnapshotFile(t, root, "case.txt", "Needle\nneedle\nNEEDLE\npin\n")
+
+	matches, _ := searchFor(t, root, "[nN][eE]+dle", func(options *Options) {
+		matcher, err := Compile(ModeRegex, "[nN][eE]+dle", true)
+		require.NoError(t, err)
+		options.Matcher = matcher
+	})
+	require.Len(t, matches, 2)
+	assert.Equal(t, 1, matches[0].Line)
+	assert.Equal(t, 2, matches[1].Line)
 }
 
 func TestSearchContextBoundaries(t *testing.T) {
 	root := t.TempDir()
 	writeSnapshotFile(t, root, "lines.txt", "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\n")
 
-	matches, err := Search(context.Background(), root, "line-4")
-	require.NoError(t, err)
+	matches, _ := searchFor(t, root, "line-4", nil)
 	require.Len(t, matches, 1)
 	require.Len(t, matches[0].Context, 4)
 	assert.Equal(t, []int{2, 3, 5, 6}, contextNumbers(matches[0]))
 
-	matches, err = Search(context.Background(), root, "line-1")
-	require.NoError(t, err)
+	matches, _ = searchFor(t, root, "line-1", nil)
 	require.Len(t, matches, 1)
 	require.Len(t, matches[0].Context, 2)
 	assert.Equal(t, []int{2, 3}, contextNumbers(matches[0]))
 
-	matches, err = Search(context.Background(), root, "line-7")
-	require.NoError(t, err)
+	matches, _ = searchFor(t, root, "line-7", nil)
 	require.Len(t, matches, 1)
 	require.Len(t, matches[0].Context, 2)
 	assert.Equal(t, []int{5, 6}, contextNumbers(matches[0]))
+
+	matches, _ = searchFor(t, root, "line-4", func(options *Options) {
+		options.ContextLines = 0
+	})
+	require.Len(t, matches, 1)
+	assert.Empty(t, matches[0].Context)
 }
 
 func contextNumbers(match Match) []int {
@@ -561,30 +612,18 @@ func contextNumbers(match Match) []int {
 	return numbers
 }
 
-func TestSearchStopsAtOversizedLines(t *testing.T) {
-	root := t.TempDir()
-	writeSnapshotFile(t, root, "big.txt", "needle before\n"+strings.Repeat("x", 2*maxLineBytes)+"\nneedle after\n")
-
-	matches, err := Search(context.Background(), root, "needle")
-	require.NoError(t, err)
-	// The scan stops at the overlong line; earlier content is still searched.
-	require.Len(t, matches, 1)
-	assert.Equal(t, 1, matches[0].Line)
-}
-
 func TestSearchTruncatesLongLines(t *testing.T) {
 	root := t.TempDir()
 	long := strings.Repeat("字", maxLineRunes+50)
 	writeSnapshotFile(t, root, "long.txt", long+" needle\n")
 
-	matches, err := Search(context.Background(), root, "needle")
-	require.NoError(t, err)
+	matches, _ := searchFor(t, root, "needle", nil)
 	require.Len(t, matches, 1)
 	assert.True(t, strings.HasSuffix(matches[0].LineText, "…"))
 	assert.Len(t, []rune(matches[0].LineText), maxLineRunes+1)
 }
 
-func TestSearchCapsMatches(t *testing.T) {
+func TestSearchCapsMatchesAndReportsTruncation(t *testing.T) {
 	root := t.TempDir()
 	var lines []string
 	for index := 0; index < 100; index++ {
@@ -592,21 +631,55 @@ func TestSearchCapsMatches(t *testing.T) {
 	}
 	writeSnapshotFile(t, root, "many.txt", strings.Join(lines, ""))
 
-	matches, err := Search(context.Background(), root, "needle")
-	require.NoError(t, err)
-	assert.Len(t, matches, MaxMatches)
+	matches, stats := searchFor(t, root, "needle", func(options *Options) {
+		options.MaxResults = 10
+	})
+	assert.Len(t, matches, 10)
+	assert.True(t, stats.Truncated)
 }
 
-func TestSearchRequiresQuery(t *testing.T) {
+func TestSearchRequiresMatcher(t *testing.T) {
 	root := t.TempDir()
-	_, err := Search(context.Background(), root, "")
+	_, _, err := Search(context.Background(), root, Options{MaxResults: 1, MaxFileBytes: 1024})
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidOptions)
+
+	_, err = Compile(ModeLiteral, "", true)
+	require.Error(t, err)
+	_, err = Compile(ModeRegex, "", true)
+	require.Error(t, err)
+	_, err = Compile("bogus", "needle", true)
+	require.Error(t, err)
+}
+
+func TestSearchValidatesOptions(t *testing.T) {
+	root := t.TempDir()
+
+	_, _, err := Search(context.Background(), root, literalOptions("needle"))
+	require.NoError(t, err)
+
+	bad := []func(*Options){
+		func(options *Options) { options.ContextLines = MaxContextLines + 1 },
+		func(options *Options) { options.ContextLines = -1 },
+		func(options *Options) { options.MaxResults = 0 },
+		func(options *Options) { options.MaxResults = MaxResultsLimit + 1 },
+		func(options *Options) { options.MaxFileBytes = 0 },
+		func(options *Options) { options.Include = []string{"/absolute"} },
+		func(options *Options) { options.Include = []string{".."} },
+		func(options *Options) { options.Exclude = []string{"a\\b"} },
+	}
+	for _, mutate := range bad {
+		options := literalOptions("needle")
+		mutate(&options)
+		_, _, err := Search(context.Background(), root, options)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidOptions)
+	}
 }
 
 func TestSearchEmptySnapshot(t *testing.T) {
 	root := t.TempDir()
-	matches, err := Search(context.Background(), root, "needle")
-	require.NoError(t, err)
+	matches, _ := searchFor(t, root, "needle", nil)
 	assert.Empty(t, matches)
 }
 
@@ -615,14 +688,124 @@ func TestSearchOnlyRegularFiles(t *testing.T) {
 	writeSnapshotFile(t, root, "hit.txt", "needle\n")
 	require.NoError(t, os.Mkdir(filepath.Join(root, "needle-dir"), 0o700))
 
-	matches, err := Search(context.Background(), root, "needle")
-	require.NoError(t, err)
+	matches, _ := searchFor(t, root, "needle", nil)
 	require.Len(t, matches, 1)
 	assert.Equal(t, "hit.txt", matches[0].Path)
 	assert.Equal(t, 1, matches[0].Line)
 	assert.Equal(t, 1, matches[0].Column)
 	assert.Equal(t, "needle", matches[0].LineText)
 	assert.Empty(t, matches[0].Context)
+}
+
+func TestSearchSkipsBinaryAndInvalidUTF8(t *testing.T) {
+	root := t.TempDir()
+	writeSnapshotFile(t, root, "text.txt", "needle\n")
+	writeSnapshotFile(t, root, "nul.dat", "needle\x00\n")
+	writeSnapshotFile(t, root, "invalid.txt", "needle \xff\n")
+
+	matches, stats := searchFor(t, root, "needle", nil)
+	require.Len(t, matches, 1)
+	assert.Equal(t, "text.txt", matches[0].Path)
+	assert.Equal(t, 2, stats.SkippedBinary)
+	assert.Equal(t, 0, stats.SkippedOversized)
+}
+
+func TestSearchSkipsOversizedFiles(t *testing.T) {
+	root := t.TempDir()
+	writeSnapshotFile(t, root, "small.txt", "needle\n")
+	writeSnapshotFile(t, root, "large.txt", "needle "+strings.Repeat("x", 256)+"\n")
+
+	matches, stats := searchFor(t, root, "needle", func(options *Options) {
+		options.MaxFileBytes = 32
+	})
+	require.Len(t, matches, 1)
+	assert.Equal(t, 1, stats.SkippedOversized)
+	assert.Equal(t, 0, stats.SkippedBinary)
+}
+
+func TestSearchableFileReportsUnreadableAsSkipped(t *testing.T) {
+	content, skipped := readSearchableFile(filepath.Join(t.TempDir(), "gone.txt"), DefaultMaxFileBytes)
+	assert.Nil(t, content)
+	assert.Equal(t, skippedUnreadable, skipped)
+}
+
+func TestSearchExcludesGitDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeSnapshotFile(t, root, "hit.txt", "needle\n")
+	writeSnapshotFile(t, root, ".git/hooks/needle", "needle\n")
+
+	matches, _ := searchFor(t, root, "needle", nil)
+	require.Len(t, matches, 1)
+	assert.Equal(t, "hit.txt", matches[0].Path)
+}
+
+func TestSearchIncludeAndExcludeGlobs(t *testing.T) {
+	root := t.TempDir()
+	writeSnapshotFile(t, root, "src/a.go", "needle\n")
+	writeSnapshotFile(t, root, "docs/b.md", "needle\n")
+	writeSnapshotFile(t, root, "vendor/c.go", "needle\n")
+
+	matches, _ := searchFor(t, root, "needle", func(options *Options) {
+		options.Include = []string{"*.go"}
+	})
+	require.Len(t, matches, 2)
+	assert.Equal(t, "src/a.go", matches[0].Path)
+	assert.Equal(t, "vendor/c.go", matches[1].Path)
+
+	matches, _ = searchFor(t, root, "needle", func(options *Options) {
+		options.Include = []string{"*.go"}
+		options.Exclude = []string{"vendor/*"}
+	})
+	require.Len(t, matches, 1)
+	assert.Equal(t, "src/a.go", matches[0].Path)
+
+	matches, _ = searchFor(t, root, "needle", func(options *Options) {
+		options.Include = []string{"src/*.go"}
+	})
+	require.Len(t, matches, 1)
+	assert.Equal(t, "src/a.go", matches[0].Path)
+}
+
+func TestSearchTimeoutWithPartialMatches(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index < 8; index++ {
+		writeSnapshotFile(t, root, fmt.Sprintf("file-%d.txt", index), "needle\n")
+	}
+
+	// WalkDir visits the root and every file sequentially, so expiring the
+	// context after the fourth Err call searches file-0 through file-2 and
+	// times out before file-3, producing a deterministic partial result.
+	calls := 0
+	ctx := expiringContext{Context: context.Background(), expire: func() bool {
+		calls++
+		return calls > 4
+	}}
+	matches, stats, err := Search(ctx, root, literalOptions("needle"))
+	require.NoError(t, err)
+	assert.True(t, stats.TimedOut)
+	require.Len(t, matches, 3)
+}
+
+// expiringContext is a context.Context whose Err reports DeadlineExceeded
+// once expire returns true, letting tests time a walk deterministically.
+type expiringContext struct {
+	context.Context
+	expire func() bool
+}
+
+func (c expiringContext) Err() error {
+	if c.expire() {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func (c expiringContext) Done() <-chan struct{} {
+	return nil
+}
+
+func (c expiringContext) Deadline() (time.Time, bool) {
+	return time.Time{}, false
 }
 
 func writeSnapshotFile(t *testing.T, root, name, body string) {

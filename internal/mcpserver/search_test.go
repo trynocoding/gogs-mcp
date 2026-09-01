@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"gogs-mcp/internal/gogs"
 	"gogs-mcp/internal/snapshot"
@@ -43,7 +44,7 @@ func singleFileArchive(t *testing.T, name, body string) func() (io.ReadCloser, e
 
 func searchTestManager(t *testing.T, limits snapshot.Limits) *snapshot.Manager {
 	t.Helper()
-	manager, err := snapshot.NewManager(t.TempDir(), "https://gogs.example.test/", limits)
+	manager, err := snapshot.NewManager(t.TempDir(), "https://gogs.example.test/", limits, snapshot.DefaultEviction())
 	require.NoError(t, err)
 	return manager
 }
@@ -206,7 +207,7 @@ func TestSearchCodeMapsUnsafeArchive(t *testing.T) {
 		"owner": "owner", "repo": "repo", "query": "needle",
 	})
 	require.NotNil(t, response.Error)
-	assert.Equal(t, "GOGS_ERROR", response.Error.Code)
+	assert.Equal(t, "ARCHIVE_UNSAFE", response.Error.Code)
 }
 
 func TestSearchCodeBoundsEncodedOutput(t *testing.T) {
@@ -245,9 +246,9 @@ func TestSearchCodeCacheIsIsolatedPerUserAndRef(t *testing.T) {
 		archiveBody: singleFileArchive(t, "file.txt", "needle\n"),
 	}
 	root := t.TempDir()
-	managerA, err := snapshot.NewManager(root, "https://a.example.test/", snapshot.DefaultLimits())
+	managerA, err := snapshot.NewManager(root, "https://a.example.test/", snapshot.DefaultLimits(), snapshot.DefaultEviction())
 	require.NoError(t, err)
-	managerB, err := snapshot.NewManager(root, "https://b.example.test/", snapshot.DefaultLimits())
+	managerB, err := snapshot.NewManager(root, "https://b.example.test/", snapshot.DefaultLimits(), snapshot.DefaultEviction())
 	require.NoError(t, err)
 	sessionA := connectTestClientWithSnapshots(t, fake, managerA)
 	sessionB := connectTestClientWithSnapshots(t, fake, managerB)
@@ -313,7 +314,7 @@ func TestSearchCodeNoSnapshotFilesEscapeCacheRoot(t *testing.T) {
 		archiveBody: singleFileArchive(t, "sub/file.txt", "needle\n"),
 	}
 	root := t.TempDir()
-	manager, err := snapshot.NewManager(root, "https://gogs.example.test/", snapshot.DefaultLimits())
+	manager, err := snapshot.NewManager(root, "https://gogs.example.test/", snapshot.DefaultLimits(), snapshot.DefaultEviction())
 	require.NoError(t, err)
 	session := connectTestClientWithSnapshots(t, fake, manager)
 
@@ -328,4 +329,190 @@ func TestSearchCodeNoSnapshotFilesEscapeCacheRoot(t *testing.T) {
 	entries, err := os.ReadDir(root)
 	require.NoError(t, err)
 	assert.Len(t, entries, 2)
+}
+
+// multiFileArchive returns a download callback serving a Gogs-style archive
+// with one regular file per map entry, wrapped in one top-level directory.
+func multiFileArchive(t *testing.T, files map[string]string) func() (io.ReadCloser, error) {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := gzip.NewWriter(&buffer)
+	archive := tar.NewWriter(writer)
+	for name, body := range files {
+		header := &tar.Header{Name: "repo-0123456/" + name, Typeflag: tar.TypeReg, Size: int64(len(body))}
+		require.NoError(t, archive.WriteHeader(header))
+		_, err := archive.Write([]byte(body))
+		require.NoError(t, err)
+	}
+	require.NoError(t, archive.Close())
+	require.NoError(t, writer.Close())
+
+	encoded := buffer.Bytes()
+	return func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(encoded)), nil
+	}
+}
+
+func TestSearchCodeRegexMode(t *testing.T) {
+	fake := &fakeClient{
+		user:        gogs.User{ID: 8, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+		archiveBody: singleFileArchive(t, "src/main.go", "Needle\nneedle\nNEEDLE\n"),
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager)
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "n.e+dle", "mode": "regex",
+		"case_sensitive": false,
+	})
+	require.Nil(t, response.Error)
+	assert.Equal(t, "regex", response.Data.Mode)
+	require.Len(t, response.Data.Matches, 3)
+	assert.Equal(t, 1, response.Data.Matches[0].Line)
+	assert.Equal(t, 2, response.Data.Matches[1].Line)
+	assert.Equal(t, 3, response.Data.Matches[2].Line)
+}
+
+func TestSearchCodeRejectsInvalidRegexBeforeResolve(t *testing.T) {
+	fake := &fakeClient{
+		user:        gogs.User{ID: 1, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager)
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "n(", "mode": "regex",
+	})
+	require.NotNil(t, response.Error)
+	assert.Equal(t, "INVALID_ARGUMENT", response.Error.Code)
+	assert.Equal(t, 0, fake.resolveCalls, "an invalid regex must fail before resolving the ref")
+	assert.Equal(t, 0, fake.archiveCalls)
+}
+
+func TestSearchCodeRejectsInvalidGlobBeforeResolve(t *testing.T) {
+	fake := &fakeClient{
+		user:        gogs.User{ID: 1, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager)
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "needle", "include": []string{"/abs"},
+	})
+	require.NotNil(t, response.Error)
+	assert.Equal(t, "INVALID_ARGUMENT", response.Error.Code)
+	assert.Equal(t, 0, fake.resolveCalls)
+	assert.Equal(t, 0, fake.archiveCalls)
+}
+
+func TestSearchCodeAppliesIncludeAndExcludeGlobs(t *testing.T) {
+	fake := &fakeClient{
+		user:        gogs.User{ID: 8, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+		archiveBody: multiFileArchive(t, map[string]string{
+			"src/a.go":    "needle\n",
+			"docs/b.md":   "needle\n",
+			"vendor/c.go": "needle\n",
+		}),
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager)
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "needle",
+		"include": []string{"*.go"}, "exclude": []string{"vendor/*"},
+	})
+	require.Nil(t, response.Error)
+	require.Len(t, response.Data.Matches, 1)
+	assert.Equal(t, "src/a.go", response.Data.Matches[0].Path)
+}
+
+func TestSearchCodeMaxResultsTruncates(t *testing.T) {
+	var lines []string
+	for index := 0; index < 20; index++ {
+		lines = append(lines, "needle\n")
+	}
+	fake := &fakeClient{
+		user:        gogs.User{ID: 8, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+		archiveBody: singleFileArchive(t, "many.txt", strings.Join(lines, "")),
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager)
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "needle", "max_results": 5,
+	})
+	require.Nil(t, response.Error)
+	require.Len(t, response.Data.Matches, 5)
+	assert.True(t, response.Meta.Truncated)
+	assert.Contains(t, strings.Join(response.Meta.Warnings, " "), "max_results")
+}
+
+func TestSearchCodeReportsSkippedFiles(t *testing.T) {
+	fake := &fakeClient{
+		user:        gogs.User{ID: 8, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+		archiveBody: multiFileArchive(t, map[string]string{
+			"text.txt":    "needle\n",
+			"binary.dat":  "needle\x00\n",
+			"invalid.txt": "needle \xff\n",
+			"big.txt":     strings.Repeat("needle", 10),
+		}),
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager, SearchDefaults{
+		Timeout:      DefaultSearchDefaults().Timeout,
+		MaxFileBytes: 16,
+	})
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "needle",
+	})
+	require.Nil(t, response.Error)
+	require.Len(t, response.Data.Matches, 1)
+	assert.Equal(t, "text.txt", response.Data.Matches[0].Path)
+
+	warnings := strings.Join(response.Meta.Warnings, " ")
+	assert.Contains(t, warnings, "Skipped 2 binary or non-UTF-8 files.")
+	assert.Contains(t, warnings, "Skipped 1 file larger than 16 bytes.")
+}
+
+func TestSearchCodeTimeoutWithoutResults(t *testing.T) {
+	fake := &fakeClient{
+		user:        gogs.User{ID: 8, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+		archiveBody: singleFileArchive(t, "file.txt", "needle\n"),
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager, SearchDefaults{
+		Timeout:      time.Nanosecond,
+		MaxFileBytes: DefaultSearchDefaults().MaxFileBytes,
+	})
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "needle",
+	})
+	require.NotNil(t, response.Error)
+	assert.Equal(t, "SEARCH_TIMEOUT", response.Error.Code)
+}
+
+func TestSearchCodeContextLinesZero(t *testing.T) {
+	fake := &fakeClient{
+		user:        gogs.User{ID: 8, Username: "tester"},
+		resolvedSHA: fullTestSHA,
+		archiveBody: singleFileArchive(t, "file.txt", "one\nneedle\nthree\n"),
+	}
+	manager := searchTestManager(t, snapshot.DefaultLimits())
+	session := connectTestClientWithSnapshots(t, fake, manager)
+
+	response := callSearchCode(t, session, map[string]any{
+		"owner": "owner", "repo": "repo", "query": "needle", "context_lines": 0,
+	})
+	require.Nil(t, response.Error)
+	require.Len(t, response.Data.Matches, 1)
+	assert.Empty(t, response.Data.Matches[0].Context)
 }

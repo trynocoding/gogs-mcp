@@ -40,7 +40,8 @@ var fallbackRequestID atomic.Uint64
 
 // New assembles the MCP server. The snapshot manager enables search_code and
 // may be nil, in which case search_code reports that search is unavailable.
-func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger) *Server {
+// The search defaults bound the per-search timeout and file size.
+func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search SearchDefaults) *Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "gogs-mcp", Version: version.Version},
 		&mcp.ServerOptions{
@@ -92,7 +93,7 @@ func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger) *Serve
 	registerRepositoryTools(server, client)
 	registerContentTools(server, client)
 	registerGitTools(server, client)
-	registerSearchTools(server, client, snapshots, &identityCache{})
+	registerSearchTools(server, client, snapshots, &identityCache{}, search)
 
 	return &Server{mcp: server}
 }

@@ -138,3 +138,62 @@ func environment(values map[string]string) LookupEnv {
 		return value, ok
 	}
 }
+
+func TestSearchAndCacheLimitsDefaults(t *testing.T) {
+	cfg, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL": "https://gogs.example.test/",
+		"GOGS_TOKEN":    "secret-token",
+	}))
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(2<<30), cfg.CacheMaxBytes)
+	assert.Equal(t, 24*time.Hour, cfg.CacheTTL)
+	assert.Equal(t, 30*time.Second, cfg.SearchTimeout)
+	assert.Equal(t, int64(1<<20), cfg.MaxFileBytes)
+}
+
+func TestSearchAndCacheLimitsOverrides(t *testing.T) {
+	cfg, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL":            "https://gogs.example.test/",
+		"GOGS_TOKEN":               "secret-token",
+		"GOGS_MCP_CACHE_MAX_BYTES": "1073741824",
+		"GOGS_MCP_CACHE_TTL":       "1h",
+		"GOGS_MCP_SEARCH_TIMEOUT":  "90s",
+		"GOGS_MCP_MAX_FILE_BYTES":  "262144",
+	}))
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1<<30), cfg.CacheMaxBytes)
+	assert.Equal(t, time.Hour, cfg.CacheTTL)
+	assert.Equal(t, 90*time.Second, cfg.SearchTimeout)
+	assert.Equal(t, int64(1<<18), cfg.MaxFileBytes)
+}
+
+func TestLoadRejectsInvalidSearchAndCacheLimits(t *testing.T) {
+	cases := map[string]string{
+		"GOGS_MCP_CACHE_MAX_BYTES": "0",
+		"GOGS_MCP_CACHE_TTL":       "-5m",
+		"GOGS_MCP_SEARCH_TIMEOUT":  "not-a-duration",
+		"GOGS_MCP_MAX_FILE_BYTES":  "0",
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load("", environment(map[string]string{
+				"GOGS_BASE_URL": "https://gogs.example.test/",
+				"GOGS_TOKEN":    "secret-token",
+				name:            value,
+			}))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestLoadRejectsSearchTimeoutAbovePerRequestCap(t *testing.T) {
+	_, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL":           "https://gogs.example.test/",
+		"GOGS_TOKEN":              "secret-token",
+		"GOGS_MCP_SEARCH_TIMEOUT": "10m",
+	}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must not exceed")
+}

@@ -23,6 +23,10 @@ const (
 	CodeTLSError                    ErrorCode = "TLS_ERROR"
 	CodeTimeout                     ErrorCode = "TIMEOUT"
 	CodeResponseTooLarge            ErrorCode = "RESPONSE_TOO_LARGE"
+	CodeInvalidArgument             ErrorCode = "INVALID_ARGUMENT"
+	CodeArchiveUnsafe               ErrorCode = "ARCHIVE_UNSAFE"
+	CodeSearchTimeout               ErrorCode = "SEARCH_TIMEOUT"
+	CodeCacheCapacityExceeded       ErrorCode = "CACHE_CAPACITY_EXCEEDED"
 	CodeInternal                    ErrorCode = "INTERNAL_ERROR"
 )
 

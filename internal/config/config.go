@@ -16,9 +16,16 @@ import (
 )
 
 const (
-	defaultHTTPTimeout = 30 * time.Second
-	maxConfigBytes     = 1 << 20
-	maxTokenBytes      = 8 << 10
+	defaultHTTPTimeout   = 30 * time.Second
+	defaultCacheMaxBytes = int64(2 << 30)
+	defaultCacheTTL      = 24 * time.Hour
+	defaultSearchTimeout = 30 * time.Second
+	defaultMaxFileBytes  = int64(1 << 20)
+	// maxSearchTimeout mirrors the per-request search cap so that a server
+	// default can never exceed what one search may run for.
+	maxSearchTimeout = 5 * time.Minute
+	maxConfigBytes   = 1 << 20
+	maxTokenBytes    = 8 << 10
 )
 
 type Config struct {
@@ -32,6 +39,14 @@ type Config struct {
 	LogLevel          string
 	// CacheDir overrides the snapshot cache root. It must be an absolute path.
 	CacheDir string
+	// CacheMaxBytes bounds the snapshot cache size per Gogs user.
+	CacheMaxBytes int64
+	// CacheTTL evicts snapshots untouched for this long.
+	CacheTTL time.Duration
+	// SearchTimeout bounds each code search.
+	SearchTimeout time.Duration
+	// MaxFileBytes skips files larger than this during code search.
+	MaxFileBytes int64
 }
 
 type fileConfig struct {
@@ -42,6 +57,10 @@ type fileConfig struct {
 	WriteEnabled      *bool  `json:"write_enabled"`
 	HTTPTimeout       string `json:"http_timeout"`
 	CacheDir          string `json:"cache_dir"`
+	CacheMaxBytes     int64  `json:"cache_max_bytes"`
+	CacheTTL          string `json:"cache_ttl"`
+	SearchTimeout     string `json:"search_timeout"`
+	MaxFileBytes      int64  `json:"max_file_bytes"`
 	LogLevel          string `json:"log_level"`
 }
 
@@ -49,8 +68,12 @@ type LookupEnv func(string) (string, bool)
 
 func Load(configPath string, lookup LookupEnv) (Config, error) {
 	cfg := Config{
-		HTTPTimeout: defaultHTTPTimeout,
-		LogLevel:    "info",
+		HTTPTimeout:   defaultHTTPTimeout,
+		LogLevel:      "info",
+		CacheMaxBytes: defaultCacheMaxBytes,
+		CacheTTL:      defaultCacheTTL,
+		SearchTimeout: defaultSearchTimeout,
+		MaxFileBytes:  defaultMaxFileBytes,
 	}
 	if lookup == nil {
 		lookup = os.LookupEnv
@@ -158,6 +181,26 @@ func applyFile(cfg *Config, values fileConfig) error {
 	if values.CacheDir != "" {
 		cfg.CacheDir = values.CacheDir
 	}
+	if values.CacheMaxBytes != 0 {
+		cfg.CacheMaxBytes = values.CacheMaxBytes
+	}
+	if values.CacheTTL != "" {
+		ttl, err := time.ParseDuration(values.CacheTTL)
+		if err != nil {
+			return errors.Wrap(err, "parse cache_ttl")
+		}
+		cfg.CacheTTL = ttl
+	}
+	if values.SearchTimeout != "" {
+		timeout, err := time.ParseDuration(values.SearchTimeout)
+		if err != nil {
+			return errors.Wrap(err, "parse search_timeout")
+		}
+		cfg.SearchTimeout = timeout
+	}
+	if values.MaxFileBytes != 0 {
+		cfg.MaxFileBytes = values.MaxFileBytes
+	}
 	return nil
 }
 
@@ -207,6 +250,34 @@ func applyEnvironment(cfg *Config, lookup LookupEnv) error {
 	}
 	if value, ok := lookup("GOGS_MCP_CACHE_DIR"); ok {
 		cfg.CacheDir = value
+	}
+	if value, ok := lookup("GOGS_MCP_CACHE_MAX_BYTES"); ok {
+		bytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return errors.Wrap(err, "parse GOGS_MCP_CACHE_MAX_BYTES")
+		}
+		cfg.CacheMaxBytes = bytes
+	}
+	if value, ok := lookup("GOGS_MCP_CACHE_TTL"); ok {
+		ttl, err := time.ParseDuration(value)
+		if err != nil {
+			return errors.Wrap(err, "parse GOGS_MCP_CACHE_TTL")
+		}
+		cfg.CacheTTL = ttl
+	}
+	if value, ok := lookup("GOGS_MCP_SEARCH_TIMEOUT"); ok {
+		timeout, err := time.ParseDuration(value)
+		if err != nil {
+			return errors.Wrap(err, "parse GOGS_MCP_SEARCH_TIMEOUT")
+		}
+		cfg.SearchTimeout = timeout
+	}
+	if value, ok := lookup("GOGS_MCP_MAX_FILE_BYTES"); ok {
+		bytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return errors.Wrap(err, "parse GOGS_MCP_MAX_FILE_BYTES")
+		}
+		cfg.MaxFileBytes = bytes
 	}
 	return nil
 }
@@ -278,6 +349,21 @@ func validate(cfg *Config) error {
 	}
 	if cfg.CacheDir != "" && !filepath.IsAbs(cfg.CacheDir) {
 		return errors.New("GOGS_MCP_CACHE_DIR must be an absolute path")
+	}
+	if cfg.CacheMaxBytes <= 0 {
+		return errors.New("GOGS_MCP_CACHE_MAX_BYTES must be greater than zero")
+	}
+	if cfg.CacheTTL <= 0 {
+		return errors.New("GOGS_MCP_CACHE_TTL must be greater than zero")
+	}
+	if cfg.SearchTimeout <= 0 {
+		return errors.New("GOGS_MCP_SEARCH_TIMEOUT must be greater than zero")
+	}
+	if cfg.SearchTimeout > maxSearchTimeout {
+		return errors.Newf("GOGS_MCP_SEARCH_TIMEOUT must not exceed %s", maxSearchTimeout)
+	}
+	if cfg.MaxFileBytes <= 0 {
+		return errors.New("GOGS_MCP_MAX_FILE_BYTES must be greater than zero")
 	}
 	return nil
 }

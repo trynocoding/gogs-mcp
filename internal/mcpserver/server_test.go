@@ -220,11 +220,15 @@ func connectTestClient(t *testing.T, serverClient Client) *mcp.ClientSession {
 	return connectTestClientWithSnapshots(t, serverClient, nil)
 }
 
-func connectTestClientWithSnapshots(t *testing.T, serverClient Client, snapshots *snapshot.Manager) *mcp.ClientSession {
+func connectTestClientWithSnapshots(t *testing.T, serverClient Client, snapshots *snapshot.Manager, search ...SearchDefaults) *mcp.ClientSession {
 	t.Helper()
+	defaults := DefaultSearchDefaults()
+	if len(search) > 0 {
+		defaults = search[0]
+	}
 	ctx := context.Background()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	server := New(serverClient, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := New(serverClient, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)), defaults)
 	serverSession, err := server.MCP().Connect(ctx, serverTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {
