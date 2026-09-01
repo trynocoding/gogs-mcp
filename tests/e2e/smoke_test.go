@@ -550,12 +550,19 @@ var e2eWritingToolNames = slices.Concat(e2eToolNames, []string{"create_issue", "
 // variables and asserts the exact advertised tool list before running action.
 func useMCPClientWithOptions(t *testing.T, projectRoot, baseURL, token, cacheDir string, extraEnv []string, expectedTools []string, action func(*mcp.ClientSession)) []byte {
 	t.Helper()
+	return useMCPClientAt(t, filepath.Join(projectRoot, ".bin", "gogs-mcp"), baseURL, token, cacheDir, extraEnv, expectedTools, action)
+}
+
+// useMCPClientAt starts an installed gogs-mcp binary over stdio, for testing
+// the artifact produced by the offline package instead of the build tree.
+func useMCPClientAt(t *testing.T, binaryPath, baseURL, token, cacheDir string, extraEnv []string, expectedTools []string, action func(*mcp.ClientSession)) []byte {
+	t.Helper()
 	var stderr bytes.Buffer
 	defer func() {
 		assertNoSecrets(t, stderr.Bytes(), token)
 	}()
 
-	command := exec.Command(filepath.Join(projectRoot, ".bin", "gogs-mcp"), "serve")
+	command := exec.Command(binaryPath, "serve")
 	environment := append(filteredEnvironment(os.Environ()),
 		"GOGS_BASE_URL="+baseURL,
 		"GOGS_TOKEN="+token,

@@ -3,6 +3,16 @@ version: '3'
 env:
   GOTOOLCHAIN: go1.25.0
 
+vars:
+  PACKAGE_VERSION:
+    sh: git describe --tags --always --dirty | tr -d '\n'
+  PACKAGE_COMMIT:
+    sh: git rev-parse --short HEAD | tr -d '\n'
+  PACKAGE_BUILD_TIME:
+    sh: date -u +%Y-%m-%dT%H:%M:%SZ | tr -d '\n'
+  PACKAGE_DIR: dist/gogs-mcp-{{.PACKAGE_VERSION}}-fedora43-amd64-offline
+  PACKAGE_STAGING: dist/.source-staging
+
 tasks:
   default:
     deps: [build]
@@ -11,6 +21,59 @@ tasks:
     desc: Build the gogs-mcp binary.
     cmds:
       - go build -trimpath -o .bin/gogs-mcp ./cmd/gogs-mcp
+
+  vendor:
+    desc: Refresh the vendored dependencies used by the offline package.
+    cmds:
+      - go mod vendor
+
+  package:
+    desc: Assemble the offline Fedora 43 AMD64 bundle under dist/.
+    deps: [vendor]
+    cmds:
+      - rm -rf {{.PACKAGE_DIR}} {{.PACKAGE_DIR}}.tar.gz {{.PACKAGE_STAGING}}
+      - mkdir -p {{.PACKAGE_DIR}}/bin {{.PACKAGE_DIR}}/source {{.PACKAGE_DIR}}/config {{.PACKAGE_DIR}}/docs {{.PACKAGE_DIR}}/scripts
+      - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '-s -w -X gogs-mcp/internal/version.Version={{.PACKAGE_VERSION}} -X gogs-mcp/internal/version.Commit={{.PACKAGE_COMMIT}} -X gogs-mcp/internal/version.BuildTime={{.PACKAGE_BUILD_TIME}}' -o {{.PACKAGE_DIR}}/bin/gogs-mcp ./cmd/gogs-mcp
+      - |
+        # The source archive mirrors the working tree (tracked files, untracked
+        # source, and the fresh vendor tree) so it always matches the binary.
+        mkdir -p {{.PACKAGE_STAGING}}
+        git ls-files -c -o --exclude-standard > {{.PACKAGE_STAGING}}/file-list
+        echo vendor >> {{.PACKAGE_STAGING}}/file-list
+        tar -czf {{.PACKAGE_DIR}}/source/gogs-mcp-{{.PACKAGE_VERSION}}.tar.gz -T {{.PACKAGE_STAGING}}/file-list
+      - cp package/scripts/install.sh package/scripts/uninstall.sh package/scripts/verify-offline.sh {{.PACKAGE_DIR}}/scripts/
+      - cp package/docs/*.md {{.PACKAGE_DIR}}/docs/
+      - cp config.example.json package/config/mcp.example.json {{.PACKAGE_DIR}}/config/
+      - go run ./cmd/mkpackage -root {{.PACKAGE_DIR}} -project . -version {{.PACKAGE_VERSION}} -commit {{.PACKAGE_COMMIT}} -build-time {{.PACKAGE_BUILD_TIME}}
+      - tar -czf {{.PACKAGE_DIR}}.tar.gz -C dist $(basename {{.PACKAGE_DIR}})
+      - rm -rf {{.PACKAGE_STAGING}}
+      - echo "Wrote {{.PACKAGE_DIR}}.tar.gz"
+
+  verify:offline:
+    desc: Rebuild-proof the offline bundle without any network access.
+    deps: [package]
+    cmds:
+      - rm -rf .verify-offline && mkdir -p .verify-offline
+      - tar -xzf {{.PACKAGE_DIR}}.tar.gz -C .verify-offline
+      - sh -c 'cd .verify-offline/$(basename {{.PACKAGE_DIR}}) && sha256sum -c MANIFEST.sha256 --quiet'
+      - .verify-offline/$(basename {{.PACKAGE_DIR}})/scripts/verify-offline.sh .verify-offline/$(basename {{.PACKAGE_DIR}})
+      - |
+        # Prove the vendored source rebuilds with a local toolchain and no
+        # module proxy, as an auditor on an offline machine would.
+        mkdir -p .verify-offline/rebuild
+        tar -xzf .verify-offline/$(basename {{.PACKAGE_DIR}})/source/gogs-mcp-*.tar.gz -C .verify-offline/rebuild
+        cd .verify-offline/rebuild && env GOTOOLCHAIN=local GOPROXY=off go build -o ../rebuilt-gogs-mcp ./cmd/gogs-mcp && ../rebuilt-gogs-mcp version --json
+      - |
+        # Install and uninstall inside a network-less namespace; fall back to
+        # running them directly when the environment forbids new namespaces.
+        if unshare -n true 2>/dev/null; then
+          unshare -n sh -c "cd '$(pwd)' && .verify-offline/$(basename {{.PACKAGE_DIR}})/scripts/install.sh --prefix '$(pwd)/.verify-offline/prefix' && .verify-offline/$(basename {{.PACKAGE_DIR}})/scripts/uninstall.sh --prefix '$(pwd)/.verify-offline/prefix'"
+        else
+          .verify-offline/$(basename {{.PACKAGE_DIR}})/scripts/install.sh --prefix "$(pwd)/.verify-offline/prefix"
+          .verify-offline/$(basename {{.PACKAGE_DIR}})/scripts/uninstall.sh --prefix "$(pwd)/.verify-offline/prefix"
+        fi
+      - rm -rf .verify-offline
+      - echo "Offline verification passed."
 
   test:
     desc: Run unit and protocol tests with coverage and the race detector.

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "gogs": {
+      "type": "stdio",
+      "command": "/home/user/.local/bin/gogs-mcp",
+      "args": ["serve"],
+      "env": {
+        "GOGS_BASE_URL": "https://gogs.internal.example/",
+        "GOGS_TOKEN_FILE": "/home/user/.config/gogs-mcp/token"
+      }
+    }
+  }
+}

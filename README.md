@@ -39,6 +39,17 @@ task lint
 
 The binary is written to `.bin/gogs-mcp`.
 
+## Build the offline bundle
+
+```bash
+task package
+task verify:offline
+```
+
+`task package` assembles `dist/gogs-mcp-<version>-fedora43-amd64-offline.tar.gz`: a statically linked Linux AMD64 binary, the full source archive with vendored dependencies, the install, uninstall, and offline verification scripts, the product documentation, a SHA-256 manifest, a CycloneDX SBOM, third-party licenses, and `SOURCE-METADATA.json`. The binary embeds the version, commit, and build time, and `gogs-mcp version --json` prints them machine-readably.
+
+`task verify:offline` unpacks the bundle and proves it works without network access: it checks the manifest checksums, the binary architecture and static linking, the version identity of the binary and the source archive, the stdio MCP protocol with a placeholder configuration, a rebuild of the vendored source with `GOTOOLCHAIN=local GOPROXY=off`, and an install and uninstall round trip inside a network-less namespace when the environment allows new network namespaces.
+
 ## Run the real Gogs smoke test
 
 The smoke test requires a running Docker daemon and a sibling Gogs checkout containing commit `5dcb6c64bdf61e38dbdbb941c1d69789c560d0fb` (`v0.14.2`). It exports that exact committed tree, builds an isolated test image, creates a fresh SQLite database, user, and personal access token, and then invokes the MCP server through stdio.
