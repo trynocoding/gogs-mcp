@@ -63,7 +63,16 @@ func run() error {
 		return err
 	}
 
-	sbom, err := packagegen.BuildSBOM("gogs-mcp", *productVersion, *commit, modules)
+	image, err := packagegen.BuildImageArchive(*root, *productVersion, *commit, *buildTime)
+	if err != nil {
+		return err
+	}
+	imageDigest, err := packagegen.FileSHA256(image.Path)
+	if err != nil {
+		return err
+	}
+
+	sbom, err := packagegen.BuildSBOM("gogs-mcp", *productVersion, *commit, image.Reference, modules)
 	if err != nil {
 		return err
 	}
@@ -87,7 +96,14 @@ func run() error {
 		GogsAPI:   *gogsAPI,
 		Binary:    packagegen.Artifact{Path: "bin/gogs-mcp", SHA256: binaryDigest},
 		Source:    packagegen.Artifact{Path: "source/" + filepath.Base(sourceArchive), SHA256: sourceDigest},
-		Static:    info.Static,
+		Image: packagegen.ContainerImage{
+			Reference: image.Reference,
+			Archive: packagegen.Artifact{
+				Path:   "images/" + filepath.Base(image.Path),
+				SHA256: imageDigest,
+			},
+		},
+		Static: info.Static,
 	})
 	if err != nil {
 		return err

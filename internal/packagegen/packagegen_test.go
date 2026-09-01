@@ -123,7 +123,7 @@ func TestBuildLicensesText(t *testing.T) {
 }
 
 func TestBuildSBOMListsProductAndModules(t *testing.T) {
-	document, err := BuildSBOM("gogs-mcp", "1b11910", "1b119106e2", []Module{
+	document, err := BuildSBOM("gogs-mcp", "1b11910", "1b119106e2", "gogs-mcp:1b11910", []Module{
 		{Path: "github.com/cockroachdb/errors", Version: "v1.12.0"},
 	})
 	require.NoError(t, err)
@@ -143,10 +143,12 @@ func TestBuildSBOMListsProductAndModules(t *testing.T) {
 	assert.Equal(t, "CycloneDX", parsed.BOMFormat)
 	assert.Equal(t, "1.5", parsed.SpecVersion)
 	assert.True(t, strings.HasPrefix(parsed.SerialNumber, "urn:uuid:"))
-	require.Len(t, parsed.Components, 2)
+	require.Len(t, parsed.Components, 3)
 	assert.Equal(t, "application", parsed.Components[0].Type)
 	assert.Equal(t, "gogs-mcp", parsed.Components[0].Name)
-	assert.Equal(t, "pkg:golang/github.com/cockroachdb/errors@v1.12.0", parsed.Components[1].PURL)
+	assert.Equal(t, "container", parsed.Components[1].Type)
+	assert.Equal(t, "gogs-mcp:1b11910", parsed.Components[1].Name)
+	assert.Equal(t, "pkg:golang/github.com/cockroachdb/errors@v1.12.0", parsed.Components[2].PURL)
 }
 
 func TestManifestRoundTrip(t *testing.T) {

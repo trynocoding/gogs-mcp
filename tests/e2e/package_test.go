@@ -4,8 +4,10 @@ package e2e
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -102,18 +104,69 @@ func TestOfflinePackage(t *testing.T) {
 	packageEnv = append(packageEnv, "HOME="+home)
 	install := filepath.Join(packageDir, "scripts", "install.sh")
 	verify := filepath.Join(packageDir, "scripts", "verify-offline.sh")
+	loadImage := filepath.Join(packageDir, "scripts", "load-image.sh")
 	uninstall := filepath.Join(packageDir, "scripts", "uninstall.sh")
 
-	// The install, verify, and uninstall scripts must succeed with every
-	// interface disabled, which proves they never touch the network.
+	var metadata struct {
+		Version string `json:"version"`
+	}
+	metadataBytes, err := os.ReadFile(filepath.Join(packageDir, "SOURCE-METADATA.json"))
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(metadataBytes, &metadata))
+	imageRef := "gogs-mcp:" + metadata.Version
+
+	// The install, verify, image import, and uninstall scripts must succeed
+	// with every interface disabled, which proves they never touch the
+	// network and that importing the image never pulls from a registry.
 	offlineScript := "set -eu\n" +
 		"'" + install + "' --prefix '" + prefix + "'\n" +
 		"'" + verify + "' '" + packageDir + "'\n" +
+		"'" + loadImage + "' --engine docker '" + packageDir + "'\n" +
 		"'" + uninstall + "' --prefix '" + prefix + "'\n"
 	runFencedScript(t, packageEnv, offlineScript)
 
 	t.Log("Reinstalling outside the namespace fence for the connection test.")
 	runPackageScript(t, packageEnv, install, "--prefix", prefix)
+
+	t.Log("Exporting the image file system to prove it holds no shell or toolchain.")
+	createContext, cancelCreate := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelCreate()
+	containerName := "gogs-mcp-export-" + identifier
+	_, err = runCommand(createContext, "create the export container", "docker", "create", "--name", containerName, imageRef)
+	require.NoError(t, err)
+	// The cleanup runs after the deferred cancel above, so it builds its own
+	// context instead of reusing the canceled one.
+	t.Cleanup(func() {
+		removeContext, cancelRemove := context.WithTimeout(context.Background(), time.Minute)
+		defer cancelRemove()
+		_, _ = runCommand(removeContext, "remove the export container", "docker", "rm", "--force", containerName)
+	})
+	exportContext, cancelExport := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelExport()
+	exportOutput, err := runCommand(exportContext, "export the image file system", "docker", "export", containerName)
+	require.NoError(t, err)
+	var fileSystemEntries []string
+	// docker export adds the runtime mount points (dev, proc, sys, and the
+	// host files under etc) to the archive; they are not image content.
+	runtimeEntries := map[string]bool{
+		"dev/": true, "dev/console": true, "dev/pts/": true, "dev/shm/": true,
+		"etc/": true, "etc/hostname": true, "etc/hosts": true,
+		"etc/mtab": true, "etc/resolv.conf": true,
+		"proc/": true, "sys/": true,
+	}
+	exportReader := tar.NewReader(bytes.NewReader(exportOutput))
+	for {
+		header, err := exportReader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		if !runtimeEntries[header.Name] {
+			fileSystemEntries = append(fileSystemEntries, header.Name)
+		}
+	}
+	assert.ElementsMatch(t, []string{".dockerenv", "cache/", "gogs-mcp"}, fileSystemEntries,
+		"the image must contain only the binary and the cache directory")
 
 	t.Log("Checking that the installed files and the product manifest agree.")
 	installedList, err := os.ReadFile(filepath.Join(prefix, "share", "gogs-mcp", "installed-files.list"))
@@ -128,6 +181,45 @@ func TestOfflinePackage(t *testing.T) {
 
 	t.Log("Calling get_authenticated_user through the installed binary.")
 	useMCPClientAt(t, filepath.Join(prefix, "bin", "gogs-mcp"), baseURL, bootstrap.Token, "", nil, e2eToolNames, func(session *mcp.ClientSession) {
+		result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "get_authenticated_user",
+			Arguments: map[string]any{},
+		})
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+		var response toolResponse
+		decodeStructuredContent(t, result.StructuredContent, &response)
+		require.NotNil(t, response.Data)
+		assert.Equal(t, "package-user", response.Data.Username)
+	})
+
+	t.Log("Calling get_authenticated_user through the packaged container image.")
+	containerToken := filepath.Join(environment.tempDir, "container-token")
+	require.NoError(t, os.WriteFile(containerToken, []byte(bootstrap.Token+"\n"), 0o600))
+	// The image user 65532 must be able to read the 0600 token file through
+	// the read-only bind mount.
+	require.NoError(t, os.Chown(containerToken, 65532, 65532))
+	cacheVolume := "gogs-mcp-e2e-cache-" + identifier
+	volumeContext, cancelVolume := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelVolume()
+	_, err = runCommand(volumeContext, "create the cache volume", "docker", "volume", "create", cacheVolume)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		removeContext, cancelRemove := context.WithTimeout(context.Background(), time.Minute)
+		defer cancelRemove()
+		_, _ = runCommand(removeContext, "remove the cache volume", "docker", "volume", "rm", cacheVolume)
+	})
+	containerCommand := exec.Command("docker",
+		"run", "--rm", "--interactive", "--pull=never", "--read-only",
+		"--network", environment.network,
+		"--volume", cacheVolume+":/cache",
+		"--volume", containerToken+":/run/secrets/gogs-token:ro",
+		"--env", "GOGS_BASE_URL=http://"+environment.container+":3000/",
+		"--env", "GOGS_TOKEN_FILE=/run/secrets/gogs-token",
+		"--env", "GOGS_ALLOW_INSECURE_HTTP=true",
+		imageRef, "serve",
+	)
+	useMCPClientCommand(t, containerCommand, bootstrap.Token, e2eToolNames, func(session *mcp.ClientSession) {
 		result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "get_authenticated_user",
 			Arguments: map[string]any{},

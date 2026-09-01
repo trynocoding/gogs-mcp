@@ -41,10 +41,18 @@ tasks:
         git ls-files -c -o --exclude-standard > {{.PACKAGE_STAGING}}/file-list
         echo vendor >> {{.PACKAGE_STAGING}}/file-list
         tar -czf {{.PACKAGE_DIR}}/source/gogs-mcp-{{.PACKAGE_VERSION}}.tar.gz -T {{.PACKAGE_STAGING}}/file-list
-      - cp package/scripts/install.sh package/scripts/uninstall.sh package/scripts/verify-offline.sh {{.PACKAGE_DIR}}/scripts/
+      - cp package/scripts/install.sh package/scripts/uninstall.sh package/scripts/verify-offline.sh package/scripts/load-image.sh {{.PACKAGE_DIR}}/scripts/
       - cp package/docs/*.md {{.PACKAGE_DIR}}/docs/
-      - cp config.example.json package/config/mcp.example.json {{.PACKAGE_DIR}}/config/
-      - go run ./cmd/mkpackage -root {{.PACKAGE_DIR}} -project . -version {{.PACKAGE_VERSION}} -commit {{.PACKAGE_COMMIT}} -build-time {{.PACKAGE_BUILD_TIME}}
+      - cp config.example.json package/config/mcp.example.json package/config/docker-mcp.example.json package/config/podman-mcp.example.json {{.PACKAGE_DIR}}/config/
+      - |
+        # The metadata and the OCI image are assembled with every network
+        # interface removed; the fallback keeps environments without user
+        # namespaces usable.
+        if unshare -n true 2>/dev/null; then
+          unshare -n go run ./cmd/mkpackage -root {{.PACKAGE_DIR}} -project . -version {{.PACKAGE_VERSION}} -commit {{.PACKAGE_COMMIT}} -build-time {{.PACKAGE_BUILD_TIME}}
+        else
+          go run ./cmd/mkpackage -root {{.PACKAGE_DIR}} -project . -version {{.PACKAGE_VERSION}} -commit {{.PACKAGE_COMMIT}} -build-time {{.PACKAGE_BUILD_TIME}}
+        fi
       - tar -czf {{.PACKAGE_DIR}}.tar.gz -C dist $(basename {{.PACKAGE_DIR}})
       - rm -rf {{.PACKAGE_STAGING}}
       - echo "Wrote {{.PACKAGE_DIR}}.tar.gz"
@@ -57,6 +65,14 @@ tasks:
       - tar -xzf {{.PACKAGE_DIR}}.tar.gz -C .verify-offline
       - sh -c 'cd .verify-offline/$(basename {{.PACKAGE_DIR}}) && sha256sum -c MANIFEST.sha256 --quiet'
       - .verify-offline/$(basename {{.PACKAGE_DIR}})/scripts/verify-offline.sh .verify-offline/$(basename {{.PACKAGE_DIR}})
+      - |
+        # When a container engine is present, import the OCI image and verify
+        # its identity with pulls disabled; skip on engine-less machines.
+        if command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
+          .verify-offline/$(basename {{.PACKAGE_DIR}})/scripts/load-image.sh .verify-offline/$(basename {{.PACKAGE_DIR}})
+        else
+          echo "No container engine found; skipping the OCI image check."
+        fi
       - |
         # Prove the vendored source rebuilds with a local toolchain and no
         # module proxy, as an auditor on an offline machine would.

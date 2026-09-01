@@ -10,8 +10,11 @@ public internet.
 - `source/gogs-mcp-<version>.tar.gz` contains the full source tree with the
   vendored Go dependencies, so the bundle can be audited and rebuilt with a
   local Go toolchain.
-- `scripts/` contains the install, uninstall, and offline verification
-  scripts.
+- `images/gogs-mcp-<version>-linux-amd64-oci.tar` is the OCI image of the
+  server; see `container.md` for importing and running it with Podman or
+  Docker.
+- `scripts/` contains the install, uninstall, offline verification, and
+  image loading scripts.
 - `docs/` contains the product documentation.
 - `config/` contains example configuration files.
 - `MANIFEST.sha256` lists the SHA-256 digest of every package file.

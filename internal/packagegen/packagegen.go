@@ -171,19 +171,28 @@ func BuildLicensesText(vendorDir string, modules []Module) ([]byte, error) {
 }
 
 // BuildSBOM renders a minimal but valid CycloneDX 1.5 document listing the
-// product and every vendored module.
-func BuildSBOM(product, version, commit string, modules []Module) ([]byte, error) {
+// product, its container image, and every vendored module.
+func BuildSBOM(product, version, commit, imageReference string, modules []Module) ([]byte, error) {
 	serial, err := randomUUID()
 	if err != nil {
 		return nil, err
 	}
-	components := []map[string]any{{
-		"type":    "application",
-		"bom-ref": "pkg:golang/" + product + "@" + version,
-		"name":    product,
-		"version": version,
-		"purl":    "pkg:golang/" + product + "@" + version,
-	}}
+	components := []map[string]any{
+		{
+			"type":    "application",
+			"bom-ref": "pkg:golang/" + product + "@" + version,
+			"name":    product,
+			"version": version,
+			"purl":    "pkg:golang/" + product + "@" + version,
+		},
+		{
+			"type":    "container",
+			"bom-ref": "pkg:oci/" + imageReference,
+			"name":    imageReference,
+			"version": version,
+			"purl":    "pkg:oci/" + imageReference,
+		},
+	}
 	for _, module := range modules {
 		components = append(components, map[string]any{
 			"type":    "library",
@@ -224,16 +233,24 @@ func randomUUID() (string, error) {
 // package so verification can tie the binary, the source archive, and the
 // build metadata together.
 type SourceMetadata struct {
-	Product   string   `json:"product"`
-	Version   string   `json:"version"`
-	Commit    string   `json:"commit"`
-	BuildTime string   `json:"build_time"`
-	GoVersion string   `json:"go_version"`
-	Target    Target   `json:"target"`
-	GogsAPI   string   `json:"gogs_api_target"`
-	Binary    Artifact `json:"binary"`
-	Source    Artifact `json:"source_archive"`
-	Static    bool     `json:"statically_linked"`
+	Product   string         `json:"product"`
+	Version   string         `json:"version"`
+	Commit    string         `json:"commit"`
+	BuildTime string         `json:"build_time"`
+	GoVersion string         `json:"go_version"`
+	Target    Target         `json:"target"`
+	GogsAPI   string         `json:"gogs_api_target"`
+	Binary    Artifact       `json:"binary"`
+	Source    Artifact       `json:"source_archive"`
+	Image     ContainerImage `json:"container_image"`
+	Static    bool           `json:"statically_linked"`
+}
+
+// ContainerImage records the reference of the bundled OCI image and the
+// archive that carries it.
+type ContainerImage struct {
+	Reference string   `json:"reference"`
+	Archive   Artifact `json:"archive"`
 }
 
 // Target is the operating system and architecture the binary was built for.

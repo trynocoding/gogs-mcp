@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "gogs": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "--rm", "--interactive", "--pull=never", "--read-only",
+        "--user", "65532:65532",
+        "--volume", "gogs-mcp-cache:/cache",
+        "--volume", "/home/user/.config/gogs-mcp/container-token:/run/secrets/gogs-token:ro",
+        "--env", "GOGS_BASE_URL=https://gogs.internal.example/",
+        "--env", "GOGS_TOKEN_FILE=/run/secrets/gogs-token",
+        "gogs-mcp:0.1.0"
+      ]
+    }
+  }
+}

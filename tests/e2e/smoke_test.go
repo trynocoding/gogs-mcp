@@ -557,12 +557,6 @@ func useMCPClientWithOptions(t *testing.T, projectRoot, baseURL, token, cacheDir
 // the artifact produced by the offline package instead of the build tree.
 func useMCPClientAt(t *testing.T, binaryPath, baseURL, token, cacheDir string, extraEnv []string, expectedTools []string, action func(*mcp.ClientSession)) []byte {
 	t.Helper()
-	var stderr bytes.Buffer
-	defer func() {
-		assertNoSecrets(t, stderr.Bytes(), token)
-	}()
-
-	command := exec.Command(binaryPath, "serve")
 	environment := append(filteredEnvironment(os.Environ()),
 		"GOGS_BASE_URL="+baseURL,
 		"GOGS_TOKEN="+token,
@@ -573,7 +567,20 @@ func useMCPClientAt(t *testing.T, binaryPath, baseURL, token, cacheDir string, e
 		environment = append(environment, "GOGS_MCP_CACHE_DIR="+cacheDir)
 	}
 	environment = append(environment, extraEnv...)
+	command := exec.Command(binaryPath, "serve")
 	command.Env = environment
+	return useMCPClientCommand(t, command, token, expectedTools, action)
+}
+
+// useMCPClientCommand starts the server described by command over stdio, for
+// testing the packaged container image as well as plain binaries, and asserts
+// the exact advertised tool list before running action.
+func useMCPClientCommand(t *testing.T, command *exec.Cmd, token string, expectedTools []string, action func(*mcp.ClientSession)) []byte {
+	t.Helper()
+	var stderr bytes.Buffer
+	defer func() {
+		assertNoSecrets(t, stderr.Bytes(), token)
+	}()
 	command.Stderr = &stderr
 
 	client := mcp.NewClient(&mcp.Implementation{
