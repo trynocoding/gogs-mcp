@@ -82,7 +82,6 @@ func TestSmoke(t *testing.T) {
 	bootstrapOutput, err := runSensitiveCommand(
 		commandContext,
 		"bootstrap the Gogs smoke database",
-		"docker",
 		"run",
 		"--rm",
 		"--name", environment.bootstrapContainer,
@@ -549,6 +548,10 @@ func useMCPClient(t *testing.T, projectRoot, baseURL, token string, action func(
 		"get_repository",
 		"list_directory",
 		"get_file",
+		"list_branches",
+		"get_branch",
+		"list_commits",
+		"get_commit",
 	}, names)
 	action(session)
 	require.NoError(t, session.Close())
@@ -601,8 +604,8 @@ func runCommand(ctx context.Context, operation, command string, arguments ...str
 	return output, nil
 }
 
-func runSensitiveCommand(ctx context.Context, operation, command string, arguments ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, command, arguments...)
+func runSensitiveCommand(ctx context.Context, operation string, arguments ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "docker", arguments...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, errors.Wrap(err, operation)

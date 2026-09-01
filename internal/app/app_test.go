@@ -126,6 +126,10 @@ func TestServeOverStdioWithOfficialClient(t *testing.T) {
 		"get_repository",
 		"list_directory",
 		"get_file",
+		"list_branches",
+		"get_branch",
+		"list_commits",
+		"get_commit",
 	}, names)
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{

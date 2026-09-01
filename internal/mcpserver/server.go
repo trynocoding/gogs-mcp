@@ -21,6 +21,10 @@ type Client interface {
 	GetRepository(context.Context, string, string) (gogs.Repository, error)
 	ListDirectory(context.Context, string, string, string, string) ([]gogs.ContentEntry, string, error)
 	GetFile(context.Context, string, string, string, string) (gogs.FileContent, error)
+	ListBranches(context.Context, string, string) ([]gogs.Branch, error)
+	GetBranch(context.Context, string, string, string) (gogs.Branch, error)
+	ListCommits(context.Context, string, string, int) ([]gogs.Commit, error)
+	GetCommit(context.Context, string, string, string) (gogs.Commit, error)
 }
 
 type Server struct {
@@ -82,6 +86,7 @@ func New(client Client, logger *slog.Logger) *Server {
 	})
 	registerRepositoryTools(server, client)
 	registerContentTools(server, client)
+	registerGitTools(server, client)
 
 	return &Server{mcp: server}
 }

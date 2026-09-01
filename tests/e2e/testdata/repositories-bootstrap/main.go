@@ -242,7 +242,9 @@ func seedRepository(repository *database.Repository) (repositoryRefs, error) {
 	if err := os.WriteFile(filepath.Join(worktree, "src", "version.txt"), []byte("main-version\n第二行\nthird\n"), 0o644); err != nil {
 		return repositoryRefs{}, errors.Wrap(err, "write main fixture")
 	}
-	if err := runGit(worktree, "commit", "-am", "Change main version"); err != nil {
+	// The body is part of the fixture because Gogs v0.14.2 only exposes the
+	// first line of a commit message, which the git E2E asserts.
+	if err := runGit(worktree, "commit", "-am", "Change main version\n\nThis body line is not exposed by Gogs v0.14.2."); err != nil {
 		return repositoryRefs{}, err
 	}
 	mainSHA, err := gitOutput(worktree, "rev-parse", "HEAD")

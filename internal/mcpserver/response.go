@@ -86,3 +86,42 @@ type File struct {
 	Target       string `json:"target,omitempty"`
 	SubmoduleURL string `json:"submodule_url,omitempty"`
 }
+
+type Branch struct {
+	Name    string `json:"name"`
+	HeadSHA string `json:"head_sha"`
+}
+
+type BranchPage struct {
+	Branches []Branch `json:"branches"`
+	Page     int      `json:"page"`
+	PerPage  int      `json:"per_page"`
+	Total    int      `json:"total"`
+}
+
+type CommitSummary struct {
+	SHA        string `json:"sha"`
+	Message    string `json:"message"`
+	AuthorName string `json:"author_name"`
+	AuthorDate string `json:"author_date"`
+}
+
+type CommitPage struct {
+	Commits []CommitSummary `json:"commits"`
+	Limit   int             `json:"limit"`
+}
+
+type CommitPerson struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	Date  string `json:"date"`
+}
+
+type Commit struct {
+	SHA        string       `json:"sha"`
+	Message    string       `json:"message"`
+	WebURL     string       `json:"web_url"`
+	Author     CommitPerson `json:"author"`
+	Committer  CommitPerson `json:"committer"`
+	ParentSHAs []string     `json:"parent_shas,omitempty"`
+}

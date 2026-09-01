@@ -40,6 +40,12 @@ tasks:
     cmds:
       - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestContents$'
 
+  test:e2e:git:
+    desc: Run branch and commit inspection tests against isolated Gogs v0.14.2.
+    deps: [build]
+    cmds:
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestGit$'
+
   lint:
     desc: Run all configured linters.
     cmds:

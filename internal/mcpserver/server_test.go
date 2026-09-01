@@ -35,6 +35,17 @@ type fakeClient struct {
 	fileCalls        int
 	filePath         string
 	contentRef       string
+	branches         []gogs.Branch
+	branch           gogs.Branch
+	branchErr        error
+	branchCalls      int
+	branchName       string
+	commits          []gogs.Commit
+	commitLimit      int
+	commitErr        error
+	commitCalls      int
+	commit           gogs.Commit
+	commitSHA        string
 }
 
 func (c *fakeClient) GetAuthenticatedUser(context.Context) (gogs.User, error) {
@@ -67,6 +78,29 @@ func (c *fakeClient) GetFile(_ context.Context, _, _, repositoryPath, ref string
 	return c.file, c.fileErr
 }
 
+func (c *fakeClient) ListBranches(context.Context, string, string) ([]gogs.Branch, error) {
+	c.branchCalls++
+	return c.branches, c.branchErr
+}
+
+func (c *fakeClient) GetBranch(_ context.Context, _, _, branch string) (gogs.Branch, error) {
+	c.branchCalls++
+	c.branchName = branch
+	return c.branch, c.branchErr
+}
+
+func (c *fakeClient) ListCommits(_ context.Context, _, _ string, limit int) ([]gogs.Commit, error) {
+	c.commitCalls++
+	c.commitLimit = limit
+	return c.commits, c.commitErr
+}
+
+func (c *fakeClient) GetCommit(_ context.Context, _, _, sha string) (gogs.Commit, error) {
+	c.commitCalls++
+	c.commitSHA = sha
+	return c.commit, c.commitErr
+}
+
 func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 	session := connectTestClient(t, &fakeClient{user: gogs.User{
 		ID:       42,
@@ -77,7 +111,7 @@ func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 
 	list, err := session.ListTools(context.Background(), nil)
 	require.NoError(t, err)
-	require.Len(t, list.Tools, 6)
+	require.Len(t, list.Tools, 10)
 	tool := findTool(t, list.Tools, "get_authenticated_user")
 	require.NotNil(t, tool.Annotations)
 	assert.True(t, tool.Annotations.ReadOnlyHint)

@@ -10,6 +10,10 @@ Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tool
 | `get_repository` | Return repository metadata and pull, push, and admin permissions. |
 | `list_directory` | List files, directories, symlinks, and submodules at a branch, tag, or commit. |
 | `get_file` | Read a bounded text line range or return safe binary and oversized-file metadata. |
+| `list_branches` | List every branch with its head commit SHA in stable name order with client-side pagination. |
+| `get_branch` | Return a single branch and its head commit SHA. Branch names may contain slashes. |
+| `list_commits` | Return the most recent commits of the default branch with the first line of each message. |
+| `get_commit` | Return a single commit by SHA with author, committer, message subject, parents, and web URL. |
 
 ## Requirements
 
@@ -36,6 +40,7 @@ The smoke test requires a running Docker daemon and a sibling Gogs checkout cont
 task test:e2e:smoke
 task test:e2e:repositories
 task test:e2e:contents
+task test:e2e:git
 ```
 
 Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The repository E2E scenario creates an owner, a read-only collaborator, an outsider, and isolated private repositories to verify actual Gogs visibility and permission behavior. Every run uses a random host port, container network, image name, and temporary data directory. The tests remove all of them after success or failure.
@@ -43,6 +48,8 @@ Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The reposi
 `list_directory` and `get_file` accept an optional `ref` containing a branch, tag, or commit SHA. When it is omitted, the repository default branch is resolved first. Repository paths must be canonical forward-slash paths and cannot be absolute or contain NUL, backslashes, empty components, `.` or `..` components.
 
 `get_file` returns 200 lines by default and accepts at most 1000 lines. Text output is kept below the 64 KiB structured-output limit and includes `meta.next_start_line` when another line-range call can continue. Files larger than 1 MiB and binary files return metadata without their payload; oversized text results set `meta.truncated` and include a warning.
+
+`list_commits` is fixed to the default branch because Gogs v0.14.2 always starts at `HEAD` and supports only a page size. It accepts at most 100 commits, shortens messages longer than 200 characters, and sets `meta.truncated` with a warning. Gogs v0.14.2 only exposes the first line of a commit message, so `get_commit` returns that same line untruncated. `get_commit` accepts any single-segment revision Git understands (full or short SHA, tag, branch name without slashes); unknown revisions surface the Gogs response verbatim, which is a not-found error for revisions `git rev-parse` rejects and a server error for well-formed SHAs that do not exist.
 
 ## Configure credentials
 

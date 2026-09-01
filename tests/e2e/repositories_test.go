@@ -91,7 +91,6 @@ func TestRepositories(t *testing.T) {
 	bootstrapOutput, err := runSensitiveCommand(
 		commandContext,
 		"bootstrap the Gogs repository E2E database",
-		"docker",
 		"run",
 		"--rm",
 		"--name", environment.bootstrapContainer,
