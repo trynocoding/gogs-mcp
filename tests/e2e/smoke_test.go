@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -513,12 +514,41 @@ func callAuthenticatedUser(t *testing.T, projectRoot, baseURL, token string) (*m
 
 func useMCPClient(t *testing.T, projectRoot, baseURL, token string, action func(*mcp.ClientSession)) []byte {
 	t.Helper()
-	return useMCPClientWithCache(t, projectRoot, baseURL, token, "", action)
+	return useMCPClientWithOptions(t, projectRoot, baseURL, token, "", nil, e2eToolNames, action)
 }
 
 // useMCPClientWithCache starts the stdio server with an explicit snapshot cache
 // directory. An empty cacheDir keeps the default user cache location.
 func useMCPClientWithCache(t *testing.T, projectRoot, baseURL, token, cacheDir string, action func(*mcp.ClientSession)) []byte {
+	t.Helper()
+	return useMCPClientWithOptions(t, projectRoot, baseURL, token, cacheDir, nil, e2eToolNames, action)
+}
+
+// e2eToolNames is the complete tool list of the default read-only server.
+var e2eToolNames = []string{
+	"get_authenticated_user",
+	"list_repositories",
+	"search_repositories",
+	"get_repository",
+	"list_directory",
+	"get_file",
+	"list_branches",
+	"get_branch",
+	"list_commits",
+	"get_commit",
+	"search_code",
+	"list_issues",
+	"get_issue",
+	"list_issue_comments",
+}
+
+// e2eWritingToolNames additionally contains create_issue, which is only
+// registered when GOGS_MCP_WRITE_ENABLED is set.
+var e2eWritingToolNames = slices.Concat(e2eToolNames, []string{"create_issue"})
+
+// useMCPClientWithOptions starts the stdio server with extra environment
+// variables and asserts the exact advertised tool list before running action.
+func useMCPClientWithOptions(t *testing.T, projectRoot, baseURL, token, cacheDir string, extraEnv []string, expectedTools []string, action func(*mcp.ClientSession)) []byte {
 	t.Helper()
 	var stderr bytes.Buffer
 	defer func() {
@@ -535,6 +565,7 @@ func useMCPClientWithCache(t *testing.T, projectRoot, baseURL, token, cacheDir s
 	if cacheDir != "" {
 		environment = append(environment, "GOGS_MCP_CACHE_DIR="+cacheDir)
 	}
+	environment = append(environment, extraEnv...)
 	command.Env = environment
 	command.Stderr = &stderr
 
@@ -562,22 +593,7 @@ func useMCPClientWithCache(t *testing.T, projectRoot, baseURL, token, cacheDir s
 	for index, tool := range tools.Tools {
 		names[index] = tool.Name
 	}
-	assert.ElementsMatch(t, []string{
-		"get_authenticated_user",
-		"list_repositories",
-		"search_repositories",
-		"get_repository",
-		"list_directory",
-		"get_file",
-		"list_branches",
-		"get_branch",
-		"list_commits",
-		"get_commit",
-		"search_code",
-		"list_issues",
-		"get_issue",
-		"list_issue_comments",
-	}, names)
+	assert.ElementsMatch(t, expectedTools, names)
 	action(session)
 	require.NoError(t, session.Close())
 	closed = true

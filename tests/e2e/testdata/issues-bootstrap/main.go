@@ -22,6 +22,7 @@ type identity struct {
 
 type result struct {
 	User               identity `json:"user"`
+	Reader             identity `json:"reader"`
 	Repository         string   `json:"repository"`
 	OpenIssueNumber    int64    `json:"open_issue_number"`
 	CommentIssueNumber int64    `json:"comment_issue_number"`
@@ -60,10 +61,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	reader, readerIdentity, err := createIdentity(ctx, "reader", "reader@example.test")
+	if err != nil {
+		return err
+	}
 
 	repository, err := createRepository(owner, "issue-lab", "Issue tracking laboratory")
 	if err != nil {
 		return err
+	}
+	// The reader is a collaborator with read-only access, so it can create
+	// plain issues through the API but cannot use administrative fields.
+	if err = repository.AddCollaborator(reader); err != nil {
+		return errors.Wrap(err, "add Gogs E2E issue reader")
+	}
+	if err = repository.ChangeCollaborationAccessMode(reader.ID, database.AccessModeRead); err != nil {
+		return errors.Wrap(err, "set Gogs E2E issue reader access")
 	}
 
 	label := &database.Label{RepoID: repository.ID, Name: "bug", Color: "#ff0000"}
@@ -158,6 +171,7 @@ func run() error {
 
 	if err = json.NewEncoder(os.Stdout).Encode(result{
 		User:               ownerIdentity,
+		Reader:             readerIdentity,
 		Repository:         repository.Name,
 		OpenIssueNumber:    empty.Index,
 		CommentIssueNumber: commented.Index,

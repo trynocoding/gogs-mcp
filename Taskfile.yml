@@ -53,10 +53,10 @@ tasks:
       - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestSearch$'
 
   test:e2e:issues:
-    desc: Run issue browsing tests against isolated Gogs v0.14.2.
+    desc: Run issue browsing and writing tests against isolated Gogs v0.14.2.
     deps: [build]
     cmds:
-      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestIssues$'
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestIssue'
 
   lint:
     desc: Run all configured linters.

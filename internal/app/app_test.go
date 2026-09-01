@@ -368,3 +368,72 @@ func instanceRoot(t *testing.T, cacheRoot string) string {
 	t.Fatal("no instance root found in the cache")
 	return ""
 }
+
+func TestServeOverStdioRegistersWriteToolsWhenEnabled(t *testing.T) {
+	const token = "stdio-write-token"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		assert.Equal(t, "token "+token, request.Header.Get("Authorization"))
+		_, err := fmt.Fprint(writer, `{"id":88,"username":"stdio-user","full_name":"Stdio User","email":"stdio@example.test"}`)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	command := exec.Command(os.Args[0], "-test.run=^TestServeHelperProcess$")
+	command.Env = append(filteredEnvironment(os.Environ()),
+		"GOGS_MCP_HELPER_PROCESS=1",
+		"GOGS_BASE_URL="+server.URL,
+		"GOGS_TOKEN="+token,
+		"GOGS_ALLOW_INSECURE_HTTP=true",
+		"GOGS_MCP_WRITE_ENABLED=true",
+	)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+
+	client := mcp.NewClient(&mcp.Implementation{
+		Name:    "gogs-mcp-stdio-test",
+		Version: "test",
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := client.Connect(ctx, &mcp.CommandTransport{
+		Command:           command,
+		TerminateDuration: 5 * time.Second,
+	}, nil)
+	require.NoError(t, err)
+
+	tools, err := session.ListTools(ctx, nil)
+	require.NoError(t, err)
+	names := make([]string, len(tools.Tools))
+	for index, tool := range tools.Tools {
+		names[index] = tool.Name
+	}
+	assert.ElementsMatch(t, []string{
+		"get_authenticated_user",
+		"list_repositories",
+		"search_repositories",
+		"get_repository",
+		"list_directory",
+		"get_file",
+		"list_branches",
+		"get_branch",
+		"list_commits",
+		"get_commit",
+		"search_code",
+		"list_issues",
+		"get_issue",
+		"list_issue_comments",
+		"create_issue",
+	}, names)
+	create := make([]*mcp.Tool, 0, 1)
+	for _, tool := range tools.Tools {
+		if tool.Name == "create_issue" {
+			create = append(create, tool)
+		}
+	}
+	require.Len(t, create, 1)
+	require.NotNil(t, create[0].Annotations)
+	assert.False(t, create[0].Annotations.ReadOnlyHint)
+
+	require.NoError(t, session.Close())
+	assert.NotContains(t, stderr.String(), token)
+}

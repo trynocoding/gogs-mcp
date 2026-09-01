@@ -31,6 +31,10 @@ type Client interface {
 	ListIssues(context.Context, string, string, string, int) ([]gogs.IssueSummary, int, error)
 	GetIssue(context.Context, string, string, int64) (gogs.Issue, error)
 	ListIssueComments(context.Context, string, string, int64, string) ([]gogs.IssueComment, error)
+	ListRepositoryLabels(context.Context, string, string) ([]gogs.RepositoryLabel, error)
+	ListRepositoryMilestones(context.Context, string, string) ([]gogs.RepositoryMilestone, error)
+	UserExists(context.Context, string) (bool, error)
+	CreateIssue(context.Context, string, string, gogs.CreateIssueOptions) (gogs.Issue, error)
 }
 
 type Server struct {
@@ -43,8 +47,9 @@ var fallbackRequestID atomic.Uint64
 
 // New assembles the MCP server. The snapshot manager enables search_code and
 // may be nil, in which case search_code reports that search is unavailable.
-// The search defaults bound the per-search timeout and file size.
-func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search SearchDefaults) *Server {
+// The search defaults bound the per-search timeout and file size. Write tools
+// are only registered when writeEnabled is set.
+func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search SearchDefaults, writeEnabled bool) *Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "gogs-mcp", Version: version.Version},
 		&mcp.ServerOptions{
@@ -97,7 +102,7 @@ func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search
 	registerContentTools(server, client)
 	registerGitTools(server, client)
 	registerSearchTools(server, client, snapshots, &identityCache{}, search)
-	registerIssueTools(server, client)
+	registerIssueTools(server, client, writeEnabled)
 
 	return &Server{mcp: server}
 }

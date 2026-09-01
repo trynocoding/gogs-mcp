@@ -71,6 +71,17 @@ type fakeClient struct {
 	commentsCalls    int
 	commentsNumber   int64
 	commentsSince    string
+	repoLabels       []gogs.RepositoryLabel
+	repoLabelErr     error
+	repoMilestones   []gogs.RepositoryMilestone
+	repoMilestoneErr error
+	userExists       bool
+	userExistsErr    error
+	userExistsCalls  int
+	createdIssue     gogs.Issue
+	createIssueErr   error
+	createIssueCalls int
+	createdOptions   gogs.CreateIssueOptions
 }
 
 func (c *fakeClient) GetAuthenticatedUser(context.Context) (gogs.User, error) {
@@ -160,6 +171,25 @@ func (c *fakeClient) ListIssueComments(_ context.Context, _, _ string, number in
 	c.commentsNumber = number
 	c.commentsSince = since
 	return c.issueComments, c.commentsErr
+}
+
+func (c *fakeClient) ListRepositoryLabels(_ context.Context, _, _ string) ([]gogs.RepositoryLabel, error) {
+	return c.repoLabels, c.repoLabelErr
+}
+
+func (c *fakeClient) ListRepositoryMilestones(_ context.Context, _, _ string) ([]gogs.RepositoryMilestone, error) {
+	return c.repoMilestones, c.repoMilestoneErr
+}
+
+func (c *fakeClient) UserExists(_ context.Context, _ string) (bool, error) {
+	c.userExistsCalls++
+	return c.userExists, c.userExistsErr
+}
+
+func (c *fakeClient) CreateIssue(_ context.Context, _, _ string, options gogs.CreateIssueOptions) (gogs.Issue, error) {
+	c.createIssueCalls++
+	c.createdOptions = options
+	return c.createdIssue, c.createIssueErr
 }
 
 func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
@@ -255,7 +285,17 @@ func connectTestClient(t *testing.T, serverClient Client) *mcp.ClientSession {
 	return connectTestClientWithSnapshots(t, serverClient, nil)
 }
 
+func connectWritingTestClient(t *testing.T, serverClient Client) *mcp.ClientSession {
+	t.Helper()
+	return connectTestClientWithDefaults(t, serverClient, nil, true)
+}
+
 func connectTestClientWithSnapshots(t *testing.T, serverClient Client, snapshots *snapshot.Manager, search ...SearchDefaults) *mcp.ClientSession {
+	t.Helper()
+	return connectTestClientWithDefaults(t, serverClient, snapshots, false, search...)
+}
+
+func connectTestClientWithDefaults(t *testing.T, serverClient Client, snapshots *snapshot.Manager, writeEnabled bool, search ...SearchDefaults) *mcp.ClientSession {
 	t.Helper()
 	defaults := DefaultSearchDefaults()
 	if len(search) > 0 {
@@ -263,7 +303,7 @@ func connectTestClientWithSnapshots(t *testing.T, serverClient Client, snapshots
 	}
 	ctx := context.Background()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	server := New(serverClient, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)), defaults)
+	server := New(serverClient, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)), defaults, writeEnabled)
 	serverSession, err := server.MCP().Connect(ctx, serverTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {

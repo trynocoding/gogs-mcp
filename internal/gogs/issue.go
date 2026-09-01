@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -31,6 +32,7 @@ type Issue struct {
 	NumComments int
 	CreatedAt   string
 	UpdatedAt   string
+	WebURL      string
 }
 
 // IssueSummary is the compact issue representation used by listings; the
@@ -67,6 +69,31 @@ type IssueComment struct {
 	UpdatedAt string
 }
 
+// RepositoryLabel is a label defined in a repository.
+type RepositoryLabel struct {
+	ID    int64
+	Name  string
+	Color string
+}
+
+// RepositoryMilestone is a milestone defined in a repository.
+type RepositoryMilestone struct {
+	ID    int64
+	Title string
+	State string
+}
+
+// CreateIssueOptions are the fields of a new issue. Assignee, label, and
+// milestone references are administrative fields that Gogs silently drops
+// without repository write access.
+type CreateIssueOptions struct {
+	Title       string
+	Body        string
+	Assignee    string
+	LabelIDs    []int64
+	MilestoneID int64
+}
+
 type issueUserResponse = userResponse
 
 type issueResponse struct {
@@ -89,7 +116,14 @@ type issueLabelResponse struct {
 	Color string `json:"color"`
 }
 
+type labelResponse struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
 type milestoneResponse struct {
+	ID    int64  `json:"id"`
 	Title string `json:"title"`
 	State string `json:"state"`
 }
@@ -139,7 +173,87 @@ func (c *Client) GetIssue(ctx context.Context, owner, repo string, number int64)
 		}
 		return Issue{}, err
 	}
-	return mapIssue(response), nil
+	return c.withWebURL(owner, repo, mapIssue(response)), nil
+}
+
+// CreateIssue creates an issue with exactly one POST request. A write is
+// never retried automatically: whenever the request may have reached Gogs
+// without a usable response, the outcome is reported as WRITE_OUTCOME_UNKNOWN
+// so the caller can query the issue list instead of creating a duplicate.
+func (c *Client) CreateIssue(ctx context.Context, owner, repo string, options CreateIssueOptions) (Issue, error) {
+	payload := struct {
+		Title     string  `json:"title"`
+		Body      string  `json:"body"`
+		Assignee  string  `json:"assignee,omitempty"`
+		Milestone int64   `json:"milestone,omitempty"`
+		Labels    []int64 `json:"labels,omitempty"`
+	}{
+		Title:     options.Title,
+		Body:      options.Body,
+		Assignee:  options.Assignee,
+		Milestone: options.MilestoneID,
+		Labels:    options.LabelIDs,
+	}
+	var response issueResponse
+	if err := c.postJSON(ctx, &response, payload, "repos", owner, repo, "issues"); err != nil {
+		return Issue{}, err
+	}
+	return c.withWebURL(owner, repo, mapIssue(response)), nil
+}
+
+// ListRepositoryLabels returns every label defined in the repository, closed
+// or not, so callers can resolve label names to IDs before creating issues.
+func (c *Client) ListRepositoryLabels(ctx context.Context, owner, repo string) ([]RepositoryLabel, error) {
+	var response []labelResponse
+	if err := c.getJSON(ctx, &response, "repos", owner, repo, "labels"); err != nil {
+		return nil, err
+	}
+	labels := make([]RepositoryLabel, len(response))
+	for index, entry := range response {
+		labels[index] = RepositoryLabel(entry)
+	}
+	return labels, nil
+}
+
+// ListRepositoryMilestones returns every milestone of the repository, open
+// and closed, so callers can resolve milestone titles to IDs before creating
+// issues.
+func (c *Client) ListRepositoryMilestones(ctx context.Context, owner, repo string) ([]RepositoryMilestone, error) {
+	var response []milestoneResponse
+	if err := c.getJSON(ctx, &response, "repos", owner, repo, "milestones"); err != nil {
+		return nil, err
+	}
+	milestones := make([]RepositoryMilestone, len(response))
+	for index, entry := range response {
+		milestones[index] = RepositoryMilestone(entry)
+	}
+	return milestones, nil
+}
+
+// UserExists reports whether a user with the given username exists. Gogs
+// v0.14.2 has no dedicated user lookup endpoint, but the repository listing
+// of a user answers 404 exactly when that user does not exist.
+func (c *Client) UserExists(ctx context.Context, username string) (bool, error) {
+	var response []repositoryResponse
+	if err := c.getJSON(ctx, &response, "users", username, "repos"); err != nil {
+		if AsError(err).Code == CodeResourceNotFoundOrForbidden {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// withWebURL fills in the browser URL of an issue. The Gogs v0.14.2 issue
+// payload carries no URL field, so it is derived from the instance root the
+// same way Gogs builds issue.HTMLURL().
+func (c *Client) withWebURL(owner, repo string, issue Issue) Issue {
+	root := *c.apiRoot
+	root.Path = strings.TrimSuffix(root.Path, "api/v1/")
+	root.RawPath = ""
+	issue.WebURL = strings.TrimSuffix(root.String(), "/") + "/" +
+		url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/issues/" + strconv.FormatInt(issue.Number, 10)
+	return issue
 }
 
 // ListIssueComments returns every comment of one issue that was created at or

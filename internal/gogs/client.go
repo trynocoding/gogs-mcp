@@ -1,6 +1,7 @@
 package gogs
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -203,6 +204,72 @@ func (c *Client) getJSONWithHeaders(ctx context.Context, destination any, query 
 		return header, nil
 	}
 	return nil, lastError
+}
+
+// postJSON sends one POST request with a JSON payload and decodes the JSON
+// response. Unlike the GET helpers it never retries: a write that may have
+// reached Gogs must not be repeated, so every failure is classified as
+// either a definitive rejection (nothing was written) or
+// WRITE_OUTCOME_UNKNOWN (the result must be queried before retrying).
+func (c *Client) postJSON(ctx context.Context, destination any, payload any, pathSegments ...string) error {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return errors.Wrap(err, "encode Gogs request payload")
+	}
+	requestURL := c.apiRoot.JoinPath(escapedPathSegments(pathSegments)...)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(payloadBytes))
+	if err != nil {
+		return errors.Wrap(err, "create Gogs request")
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "token "+c.token)
+	request.Header.Set("User-Agent", c.userAgent)
+
+	started := time.Now()
+	response, err := c.http.Do(request)
+	if err != nil {
+		classified := classifyWriteTransportError(err)
+		c.logRequest(ctx, 0, time.Since(started), classified.Code)
+		return classified
+	}
+
+	status := response.StatusCode
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes+1))
+	closeErr := response.Body.Close()
+	if status >= 400 && status < 500 {
+		// A client error is a definitive rejection: nothing was written,
+		// even when the response body cannot be decoded.
+		classified := classifyStatus(status)
+		c.logRequest(ctx, status, time.Since(started), classified.Code)
+		return classified
+	}
+	var cause error
+	if readErr != nil {
+		cause = readErr
+	} else if closeErr != nil {
+		cause = closeErr
+	}
+	if cause != nil || len(responseBody) > maxJSONResponseBytes || status < 200 || status >= 300 {
+		classified := &Error{
+			Code:    CodeWriteOutcomeUnknown,
+			Message: "The write was sent to Gogs but its outcome is unknown; check the result before retrying.",
+			cause:   cause,
+		}
+		c.logRequest(ctx, status, time.Since(started), classified.Code)
+		return classified
+	}
+	if err := json.Unmarshal(responseBody, destination); err != nil {
+		classified := &Error{
+			Code:    CodeWriteOutcomeUnknown,
+			Message: "The write was accepted by Gogs but the response was lost; check the result before retrying.",
+			cause:   err,
+		}
+		c.logRequest(ctx, status, time.Since(started), classified.Code)
+		return classified
+	}
+	c.logRequest(ctx, status, time.Since(started), "")
+	return nil
 }
 
 func (c *Client) logRequest(ctx context.Context, status int, duration time.Duration, code ErrorCode) {

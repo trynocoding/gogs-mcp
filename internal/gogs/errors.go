@@ -27,6 +27,7 @@ const (
 	CodeArchiveUnsafe               ErrorCode = "ARCHIVE_UNSAFE"
 	CodeSearchTimeout               ErrorCode = "SEARCH_TIMEOUT"
 	CodeCacheCapacityExceeded       ErrorCode = "CACHE_CAPACITY_EXCEEDED"
+	CodeWriteOutcomeUnknown         ErrorCode = "WRITE_OUTCOME_UNKNOWN"
 	CodeInternal                    ErrorCode = "INTERNAL_ERROR"
 )
 
@@ -54,6 +55,26 @@ func AsError(err error) *Error {
 	return &Error{
 		Code:    CodeInternal,
 		Message: "An internal error occurred.",
+	}
+}
+
+// classifyWriteTransportError classifies a failed POST request. A dial or
+// TLS handshake failure means the request never left the client, so the
+// regular transport classification applies and the write may be retried.
+// Every other transport failure leaves the outcome on the server unknown,
+// which callers must treat as WRITE_OUTCOME_UNKNOWN.
+func classifyWriteTransportError(err error) *Error {
+	var opError *net.OpError
+	if errors.As(err, &opError) && (opError.Op == "dial" || opError.Op == "proxyconnect") {
+		return classifyTransportError(err)
+	}
+	if classified := classifyTransportError(err); classified.Code == CodeTLSError {
+		return classified
+	}
+	return &Error{
+		Code:    CodeWriteOutcomeUnknown,
+		Message: "The write was sent to Gogs but its outcome is unknown; check the result before retrying.",
+		cause:   err,
 	}
 }
 

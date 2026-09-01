@@ -121,7 +121,7 @@ func runServe(
 	server := mcpserver.New(client, snapshots, logger, mcpserver.SearchDefaults{
 		Timeout:      cfg.SearchTimeout,
 		MaxFileBytes: cfg.MaxFileBytes,
-	})
+	}, cfg.WriteEnabled)
 	if err := server.Run(ctx, io.NopCloser(stdin), nopWriteCloser{stdout}); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("The MCP server stopped unexpectedly.", "error", err)
 		return exitInternal

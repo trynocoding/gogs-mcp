@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"unicode/utf8"
 
 	"gogs-mcp/internal/gogs"
 
@@ -15,6 +16,8 @@ import (
 const (
 	defaultMaxComments = 100
 	maximumMaxComments = 500
+	maxIssueTitleRunes = 255
+	maxIssueBodyBytes  = 1 << 20
 	// issueToolScope explains the role of Gogs issues relative to Jira; it is
 	// part of every issue tool description.
 	issueToolScope = "Gogs issues track repository-internal discussion; Jira remains the requirements system of record and this server does not sync with Jira."
@@ -41,7 +44,17 @@ type listIssueCommentsInput struct {
 	MaxComments int    `json:"max_comments,omitempty"`
 }
 
-func registerIssueTools(server *mcp.Server, client Client) {
+type createIssueInput struct {
+	Owner     string   `json:"owner"`
+	Repo      string   `json:"repo"`
+	Title     string   `json:"title"`
+	Body      string   `json:"body,omitempty"`
+	Assignee  string   `json:"assignee,omitempty"`
+	Labels    []string `json:"labels,omitempty"`
+	Milestone string   `json:"milestone,omitempty"`
+}
+
+func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_issues",
 		Description: "List the issues of a Gogs repository, newest state page first. " + issueToolScope,
@@ -138,6 +151,34 @@ func registerIssueTools(server *mcp.Server, client Client) {
 			Meta: meta,
 		}, nil
 	})
+
+	if !writeEnabled {
+		return
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "create_issue",
+		Description: "Create an issue in a Gogs repository with a title and an optional body. An assignee, labels, or a milestone requires repository write access and is verified to exist before the issue is created. " + issueToolScope,
+		Annotations: writeAnnotations("Create issue"),
+		InputSchema: createIssueInputSchema(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input createIssueInput) (*mcp.CallToolResult, ToolResponse[Issue], error) {
+		requestID := newRequestID()
+		ctx = gogs.WithRequestMetadata(ctx, requestID, "create_issue")
+		options, toolErr := resolveCreateIssueInput(ctx, client, input)
+		if toolErr != nil {
+			result, response := issueError(requestID, toolErr)
+			return result, response, nil
+		}
+		issue, err := client.CreateIssue(ctx, input.Owner, input.Repo, options)
+		if err != nil {
+			result, response := issueError(requestID, err)
+			return result, response, nil
+		}
+		output := mapIssue(issue)
+		return nil, ToolResponse[Issue]{
+			Data: &output,
+			Meta: ResponseMeta{RequestID: requestID},
+		}, nil
+	})
 }
 
 type issueCommentsQuery struct {
@@ -163,6 +204,97 @@ func resolveIssueCommentsInput(input listIssueCommentsInput) (issueCommentsQuery
 		}
 	}
 	return issueCommentsQuery{since: input.Since, maxComments: maxComments}, nil
+}
+
+// resolveCreateIssueInput validates the issue fields locally and resolves the
+// administrative references against Gogs. Gogs silently drops assignee, label,
+// and milestone references from users without repository write access, so any
+// managed field first requires repository push permission and every reference
+// is verified to exist before the issue is created.
+func resolveCreateIssueInput(ctx context.Context, client Client, input createIssueInput) (gogs.CreateIssueOptions, *gogs.Error) {
+	if utf8.RuneCountInString(input.Title) > maxIssueTitleRunes {
+		return gogs.CreateIssueOptions{}, &gogs.Error{
+			Code:    gogs.CodeInvalidArgument,
+			Message: errors.Newf("title must be at most %d characters", maxIssueTitleRunes).Error(),
+		}
+	}
+	if len(input.Body) > maxIssueBodyBytes {
+		return gogs.CreateIssueOptions{}, &gogs.Error{
+			Code:    gogs.CodeInvalidArgument,
+			Message: errors.Newf("body must be at most %d bytes", maxIssueBodyBytes).Error(),
+		}
+	}
+	options := gogs.CreateIssueOptions{Title: input.Title, Body: input.Body}
+	if input.Assignee == "" && len(input.Labels) == 0 && input.Milestone == "" {
+		return options, nil
+	}
+
+	repository, err := client.GetRepository(ctx, input.Owner, input.Repo)
+	if err != nil {
+		return gogs.CreateIssueOptions{}, gogs.AsError(err)
+	}
+	if !repository.Permissions.Push {
+		return gogs.CreateIssueOptions{}, &gogs.Error{
+			Code:    gogs.CodePermissionDenied,
+			Message: "Setting an assignee, labels, or a milestone requires repository write access; create the issue with only a title and body instead.",
+		}
+	}
+
+	if len(input.Labels) > 0 {
+		labels, err := client.ListRepositoryLabels(ctx, input.Owner, input.Repo)
+		if err != nil {
+			return gogs.CreateIssueOptions{}, gogs.AsError(err)
+		}
+		idsByName := make(map[string]int64, len(labels))
+		for _, label := range labels {
+			idsByName[label.Name] = label.ID
+		}
+		for _, name := range input.Labels {
+			id, ok := idsByName[name]
+			if !ok {
+				return gogs.CreateIssueOptions{}, &gogs.Error{
+					Code:    gogs.CodeInvalidArgument,
+					Message: errors.Newf("the label %q does not exist in %s/%s", name, input.Owner, input.Repo).Error(),
+				}
+			}
+			options.LabelIDs = append(options.LabelIDs, id)
+		}
+	}
+
+	if input.Milestone != "" {
+		milestones, err := client.ListRepositoryMilestones(ctx, input.Owner, input.Repo)
+		if err != nil {
+			return gogs.CreateIssueOptions{}, gogs.AsError(err)
+		}
+		for _, milestone := range milestones {
+			if milestone.Title == input.Milestone {
+				options.MilestoneID = milestone.ID
+				break
+			}
+		}
+		if options.MilestoneID == 0 {
+			return gogs.CreateIssueOptions{}, &gogs.Error{
+				Code:    gogs.CodeInvalidArgument,
+				Message: errors.Newf("the milestone %q does not exist in %s/%s", input.Milestone, input.Owner, input.Repo).Error(),
+			}
+		}
+	}
+
+	if input.Assignee != "" {
+		exists, err := client.UserExists(ctx, input.Assignee)
+		if err != nil {
+			return gogs.CreateIssueOptions{}, gogs.AsError(err)
+		}
+		if !exists {
+			return gogs.CreateIssueOptions{}, &gogs.Error{
+				Code:    gogs.CodeInvalidArgument,
+				Message: errors.Newf("the assignee %q does not exist", input.Assignee).Error(),
+			}
+		}
+		options.Assignee = input.Assignee
+	}
+
+	return options, nil
 }
 
 func mapIssueSummaries(issues []gogs.IssueSummary) []IssueSummary {
@@ -204,6 +336,7 @@ func mapIssue(issue gogs.Issue) Issue {
 		NumComments: issue.NumComments,
 		CreatedAt:   issue.CreatedAt,
 		UpdatedAt:   issue.UpdatedAt,
+		WebURL:      issue.WebURL,
 	}
 }
 
@@ -316,4 +449,46 @@ func listIssueCommentsInputSchema() *jsonschema.Schema {
 		},
 		"max_comments": integerSchema("Maximum number of comments to return, from 1 through 500. Defaults to 100.", defaultMaxComments, maximumMaxComments),
 	}, []string{"owner", "repo", "number"})
+}
+
+func createIssueInputSchema() *jsonschema.Schema {
+	return objectSchema(map[string]*jsonschema.Schema{
+		"owner": stringSchema("Repository owner username.", true, false),
+		"repo":  stringSchema("Repository name.", true, false),
+		"title": {
+			Type:        "string",
+			Description: "Issue title.",
+			MinLength:   intPointer(1),
+			MaxLength:   intPointer(maxIssueTitleRunes),
+		},
+		"body": stringSchema("Issue body in Markdown.", false, false),
+		"assignee": {
+			Type:        "string",
+			Description: "Username to assign the issue to. Requires repository write access.",
+			MinLength:   intPointer(1),
+		},
+		"labels": {
+			Type:        "array",
+			Description: "Names of labels to attach. Requires repository write access; unknown names are rejected instead of silently dropped.",
+			Items:       &jsonschema.Schema{Type: "string", MinLength: intPointer(1)},
+			UniqueItems: true,
+		},
+		"milestone": {
+			Type:        "string",
+			Description: "Title of the milestone to assign. Requires repository write access; unknown titles are rejected instead of silently dropped.",
+			MinLength:   intPointer(1),
+		},
+	}, []string{"owner", "repo", "title"})
+}
+
+// writeAnnotations mirrors readOnlyAnnotations for tools that change Gogs
+// state: the write is not read-only, not idempotent, and not destructive.
+func writeAnnotations(title string) *mcp.ToolAnnotations {
+	destructive := false
+	openWorld := true
+	return &mcp.ToolAnnotations{
+		DestructiveHint: &destructive,
+		OpenWorldHint:   &openWorld,
+		Title:           title,
+	}
 }

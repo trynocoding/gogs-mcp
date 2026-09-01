@@ -194,6 +194,7 @@ type Issue struct {
 	NumComments int             `json:"num_comments"`
 	CreatedAt   string          `json:"created_at"`
 	UpdatedAt   string          `json:"updated_at"`
+	WebURL      string          `json:"web_url"`
 }
 
 type IssueComment struct {

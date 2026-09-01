@@ -167,7 +167,7 @@ func connectWithSnapshotCache(t *testing.T, apiRoot, token, cacheDir string) *mc
 	}
 
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	server := mcpserver.New(client, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)), mcpserver.DefaultSearchDefaults())
+	server := mcpserver.New(client, snapshots, slog.New(slog.NewTextHandler(io.Discard, nil)), mcpserver.DefaultSearchDefaults(), false)
 	serverSession, err := server.MCP().Connect(context.Background(), serverTransport, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {

@@ -130,6 +130,7 @@ func TestGetIssueReturnsFullRecord(t *testing.T) {
 		NumComments: 2,
 		CreatedAt:   "2026-01-02T15:04:05Z",
 		UpdatedAt:   "2026-01-03T10:00:00Z",
+		WebURL:      "https://gogs.example.test/alice/project/issues/7",
 	}}
 	session := connectTestClient(t, client)
 
@@ -152,6 +153,7 @@ func TestGetIssueReturnsFullRecord(t *testing.T) {
 	require.NotNil(t, output.Data.Milestone)
 	assert.Equal(t, "v1.0", output.Data.Milestone.Title)
 	assert.Equal(t, 2, output.Data.NumComments)
+	assert.Equal(t, "https://gogs.example.test/alice/project/issues/7", output.Data.WebURL)
 	assert.Equal(t, int64(7), client.getIssueNumber)
 }
 
@@ -308,4 +310,246 @@ func TestListIssueCommentsTruncatesAtByteBudget(t *testing.T) {
 	assert.True(t, output.Meta.Truncated)
 	require.NotEmpty(t, output.Meta.Warnings)
 	assert.Contains(t, output.Meta.Warnings[0], "64 KiB structured output limit")
+}
+
+func TestCreateIssueIsAbsentWithoutWriteEnabled(t *testing.T) {
+	session := connectTestClient(t, &fakeClient{})
+
+	list, err := session.ListTools(context.Background(), nil)
+	require.NoError(t, err)
+	for _, tool := range list.Tools {
+		assert.NotEqual(t, "create_issue", tool.Name)
+	}
+	assert.Len(t, list.Tools, 14)
+}
+
+func TestCreateIssueAdvertisesWriteAnnotations(t *testing.T) {
+	session := connectWritingTestClient(t, &fakeClient{})
+
+	list, err := session.ListTools(context.Background(), nil)
+	require.NoError(t, err)
+	tool := findTool(t, list.Tools, "create_issue")
+	require.NotNil(t, tool)
+	require.NotNil(t, tool.Annotations)
+	assert.False(t, tool.Annotations.ReadOnlyHint)
+	assert.False(t, tool.Annotations.IdempotentHint)
+	require.NotNil(t, tool.Annotations.DestructiveHint)
+	assert.False(t, *tool.Annotations.DestructiveHint)
+	require.NotNil(t, tool.Annotations.OpenWorldHint)
+	assert.True(t, *tool.Annotations.OpenWorldHint)
+	assert.Contains(t, tool.Description, "Jira remains the requirements system of record")
+	assert.Contains(t, tool.Description, "does not sync with Jira")
+	assert.Len(t, list.Tools, 15)
+}
+
+func TestCreateIssueCreatesPlainIssueWithoutPermissionCheck(t *testing.T) {
+	client := &fakeClient{
+		createdIssue: gogs.Issue{
+			Number: 7,
+			Title:  "Fix the parser",
+			Body:   "The parser fails on empty input.",
+			State:  "open",
+			User:   gogs.User{Username: "reader"},
+			WebURL: "https://gogs.example.test/alice/project/issues/7",
+		},
+	}
+	session := connectWritingTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "create_issue",
+		Arguments: map[string]any{
+			"owner": "alice",
+			"repo":  "project",
+			"title": "Fix the parser",
+			"body":  "The parser fails on empty input.",
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+
+	var output ToolResponse[Issue]
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Data)
+	assert.Equal(t, int64(7), output.Data.Number)
+	assert.Equal(t, "Fix the parser", output.Data.Title)
+	assert.Equal(t, "open", output.Data.State)
+	assert.Equal(t, "https://gogs.example.test/alice/project/issues/7", output.Data.WebURL)
+	assert.Zero(t, client.getCalls, "a plain issue needs no write-permission check")
+	assert.Equal(t, 1, client.createIssueCalls)
+	assert.Equal(t, gogs.CreateIssueOptions{
+		Title: "Fix the parser",
+		Body:  "The parser fails on empty input.",
+	}, client.createdOptions)
+}
+
+func TestCreateIssueRejectsOversizedTitleThroughSchema(t *testing.T) {
+	client := &fakeClient{}
+	session := connectWritingTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "create_issue",
+		Arguments: map[string]any{
+			"owner": "alice",
+			"repo":  "project",
+			"title": strings.Repeat("a", maxIssueTitleRunes+1),
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+	assert.Zero(t, client.createIssueCalls)
+}
+
+func TestCreateIssueRejectsOversizedBodyBeforeCallingGogs(t *testing.T) {
+	client := &fakeClient{}
+	session := connectWritingTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "create_issue",
+		Arguments: map[string]any{
+			"owner": "alice",
+			"repo":  "project",
+			"title": "Fix the parser",
+			"body":  strings.Repeat("a", maxIssueBodyBytes+1),
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+
+	var output ToolResponse[Issue]
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Error)
+	assert.Equal(t, "INVALID_ARGUMENT", output.Error.Code)
+	assert.Zero(t, client.createIssueCalls)
+}
+
+func TestCreateIssueRejectsManagedFieldsWithoutWriteAccess(t *testing.T) {
+	client := &fakeClient{repository: gogs.Repository{
+		Permissions: gogs.RepositoryPermissions{Pull: true},
+	}}
+	session := connectWritingTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "create_issue",
+		Arguments: map[string]any{
+			"owner":  "alice",
+			"repo":   "project",
+			"title":  "Fix the parser",
+			"labels": []any{"bug"},
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+
+	var output ToolResponse[Issue]
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Error)
+	assert.Equal(t, "PERMISSION_DENIED", output.Error.Code)
+	assert.Equal(t, 1, client.getCalls)
+	assert.Zero(t, client.createIssueCalls)
+}
+
+func TestCreateIssueResolvesManagedReferences(t *testing.T) {
+	client := &fakeClient{
+		repository: gogs.Repository{
+			Permissions: gogs.RepositoryPermissions{Pull: true, Push: true},
+		},
+		repoLabels: []gogs.RepositoryLabel{
+			{ID: 1, Name: "bug", Color: "#ff0000"},
+			{ID: 2, Name: "enhancement", Color: "#00ff00"},
+		},
+		repoMilestones: []gogs.RepositoryMilestone{
+			{ID: 3, Title: "v1.0", State: "open"},
+		},
+		userExists:   true,
+		createdIssue: gogs.Issue{Number: 7, Title: "Fix the parser", State: "open"},
+	}
+	session := connectWritingTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "create_issue",
+		Arguments: map[string]any{
+			"owner":     "alice",
+			"repo":      "project",
+			"title":     "Fix the parser",
+			"assignee":  "bob",
+			"labels":    []any{"bug", "enhancement"},
+			"milestone": "v1.0",
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+
+	assert.Equal(t, 1, client.createIssueCalls)
+	assert.Equal(t, gogs.CreateIssueOptions{
+		Title:       "Fix the parser",
+		Assignee:    "bob",
+		LabelIDs:    []int64{1, 2},
+		MilestoneID: 3,
+	}, client.createdOptions)
+}
+
+func TestCreateIssueRejectsUnknownReferences(t *testing.T) {
+	client := &fakeClient{
+		repository: gogs.Repository{
+			Permissions: gogs.RepositoryPermissions{Pull: true, Push: true},
+		},
+		repoLabels:     []gogs.RepositoryLabel{{ID: 1, Name: "bug"}},
+		repoMilestones: []gogs.RepositoryMilestone{{ID: 3, Title: "v1.0"}},
+	}
+	session := connectWritingTestClient(t, client)
+
+	testCases := map[string]map[string]any{
+		"unknown label":     {"labels": []any{"bug", "ghost"}},
+		"unknown milestone": {"milestone": "v2.0"},
+		"unknown assignee":  {"assignee": "ghost"},
+	}
+	for name, extra := range testCases {
+		t.Run(name, func(t *testing.T) {
+			arguments := map[string]any{
+				"owner": "alice",
+				"repo":  "project",
+				"title": "Fix the parser",
+			}
+			for key, value := range extra {
+				arguments[key] = value
+			}
+			result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "create_issue",
+				Arguments: arguments,
+			})
+			require.NoError(t, err)
+			assert.True(t, result.IsError)
+
+			var output ToolResponse[Issue]
+			decodeStructuredContent(t, result.StructuredContent, &output)
+			require.NotNil(t, output.Error)
+			assert.Equal(t, "INVALID_ARGUMENT", output.Error.Code)
+		})
+	}
+	assert.Zero(t, client.createIssueCalls)
+}
+
+func TestCreateIssueReportsUnknownOutcomeAfterLostResponse(t *testing.T) {
+	client := &fakeClient{createIssueErr: &gogs.Error{
+		Code:    gogs.CodeWriteOutcomeUnknown,
+		Message: "The write was sent to Gogs but its outcome is unknown; check the result before retrying.",
+	}}
+	session := connectWritingTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "create_issue",
+		Arguments: map[string]any{
+			"owner": "alice",
+			"repo":  "project",
+			"title": "Fix the parser",
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+
+	var output ToolResponse[Issue]
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Error)
+	assert.Equal(t, "WRITE_OUTCOME_UNKNOWN", output.Error.Code)
+	assert.False(t, output.Error.Retryable)
 }

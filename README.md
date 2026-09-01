@@ -18,6 +18,7 @@ Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tool
 | `list_issues` | List open or closed issues with number, title, creator, labels, comment count, and timestamps, following the Gogs page order. |
 | `get_issue` | Return one issue with body, creator, assignee, labels, milestone, comment count, and timestamps. |
 | `list_issue_comments` | List the comments of one issue in creation order, optionally restricted to comments since an RFC3339 timestamp. |
+| `create_issue` | Create an issue with a title and an optional body. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
 
 ## Requirements
 
@@ -64,6 +65,8 @@ Results are bounded and every bound is observable. Up to 50 matches are returned
 The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) are expired and the least recently used snapshots are removed when the per-user cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`), before a new download starts. Snapshots held by an active search are never evicted; when no room can be made, the search fails with `CACHE_CAPACITY_EXCEEDED` instead of downloading. `gogs-mcp cache clean` removes the authenticated user's snapshot cache and `gogs-mcp cache clean --all` removes every verified cache root; configuration, tokens, and anything outside the cache root are never touched.
 
 Gogs issues track repository-internal discussion; Jira remains the requirements system of record, and this server does not sync with Jira. `list_issues` accepts only the `open` and `closed` states because Gogs v0.14.2 treats every other value as open, and it does not accept a page size because Gogs v0.14.2 fixes it server-side. The next page comes from the Gogs `Link` header and is reported as `meta.next_page` only when one exists. `list_issues` returns compact summaries without bodies; `get_issue` returns the full record with body, creator, assignee, labels, milestone, comment count, and timestamps, and reports the shared not-found code without revealing whether the repository or the issue exists. `list_issue_comments` validates the RFC3339 `since` timestamp before contacting Gogs, and bounds the result with `max_comments` (default 100, at most 500) and the 64 KiB structured-output limit; reaching either bound sets `meta.truncated` with a warning.
+
+`create_issue` is only registered when `GOGS_MCP_WRITE_ENABLED` is set, so the default server advertises exactly the read-only tool list. It never retries its POST: when the response is lost after the write reached Gogs, the tool reports `WRITE_OUTCOME_UNKNOWN` and the issue must be looked up instead of recreated. A plain issue needs only a title (1 through 255 characters) and an optional body of at most 1 MiB, and every user with issue-read access can create one. An assignee, labels, or a milestone requires repository push permission (`PERMISSION_DENIED` otherwise), because Gogs silently drops those fields for users without write access; the assignee, every label name, and the milestone title are verified to exist before the issue is created, and unknown references are rejected with `INVALID_ARGUMENT`. The result carries the issue number, its state, and its web URL, which `get_issue` can return.
 
 ## Configure credentials
 
@@ -125,7 +128,7 @@ Environment variables override file values.
 | `GOGS_MCP_CACHE_TTL` | `24h`. | How long a snapshot may stay untouched before it expires. |
 | `GOGS_MCP_SEARCH_TIMEOUT` | `30s`. | Default search time limit for `search_code`, at most `5m`. |
 | `GOGS_MCP_MAX_FILE_BYTES` | `1048576`. | Files larger than this are skipped by `search_code`. |
-| `GOGS_MCP_WRITE_ENABLED` | `false`. | Reserved for optional write tools in later deliveries. |
+| `GOGS_MCP_WRITE_ENABLED` | `false`. | Register `create_issue`. |
 | `GOGS_HTTP_TIMEOUT` | `30s`. | HTTP request timeout. |
 | `GOGS_LOG_LEVEL` | `info`. | `debug`, `info`, `warn`, or `error`. |
 
