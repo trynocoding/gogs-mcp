@@ -1,0 +1,46 @@
+version: '3'
+
+env:
+  GOTOOLCHAIN: go1.25.0
+
+tasks:
+  default:
+    deps: [build]
+
+  build:
+    desc: Build the gogs-mcp binary.
+    cmds:
+      - go build -trimpath -o .bin/gogs-mcp ./cmd/gogs-mcp
+
+  test:
+    desc: Run unit and protocol tests with coverage and the race detector.
+    cmds:
+      - go test -cover -race ./...
+
+  test:integration:
+    desc: Run HTTP contract tests through the MCP protocol layer.
+    cmds:
+      - go test -tags=integration -count=1 -v ./tests/integration
+
+  test:e2e:smoke:
+    desc: Run the isolated Gogs v0.14.2 stdio smoke test.
+    deps: [build]
+    cmds:
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestSmoke$'
+
+  test:e2e:repositories:
+    desc: Run repository visibility tests against isolated Gogs v0.14.2.
+    deps: [build]
+    cmds:
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestRepositories$'
+
+  test:e2e:contents:
+    desc: Run bounded source browsing tests against isolated Gogs v0.14.2.
+    deps: [build]
+    cmds:
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestContents$'
+
+  lint:
+    desc: Run all configured linters.
+    cmds:
+      - golangci-lint run

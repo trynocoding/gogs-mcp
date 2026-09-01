@@ -1,0 +1,9 @@
+{
+  "base_url": "https://gogs.internal.example/",
+  "token_file": "/home/user/.config/gogs-mcp/token",
+  "ca_file": "",
+  "allow_insecure_http": false,
+  "write_enabled": false,
+  "http_timeout": "30s",
+  "log_level": "info"
+}
