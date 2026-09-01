@@ -15,6 +15,9 @@ Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tool
 | `list_commits` | Return the most recent commits of the default branch with the first line of each message. |
 | `get_commit` | Return a single commit by SHA with author, committer, message subject, parents, and web URL. |
 | `search_code` | Search file content of an immutable commit snapshot with a literal or regular-expression query, bounded by result count, file size, and timeout. |
+| `list_issues` | List open or closed issues with number, title, creator, labels, comment count, and timestamps, following the Gogs page order. |
+| `get_issue` | Return one issue with body, creator, assignee, labels, milestone, comment count, and timestamps. |
+| `list_issue_comments` | List the comments of one issue in creation order, optionally restricted to comments since an RFC3339 timestamp. |
 
 ## Requirements
 
@@ -43,6 +46,7 @@ task test:e2e:repositories
 task test:e2e:contents
 task test:e2e:git
 task test:e2e:search
+task test:e2e:issues
 ```
 
 Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The repository E2E scenario creates an owner, a read-only collaborator, an outsider, and isolated private repositories to verify actual Gogs visibility and permission behavior. Every run uses a random host port, container network, image name, and temporary data directory. The tests remove all of them after success or failure.
@@ -58,6 +62,8 @@ Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The reposi
 Results are bounded and every bound is observable. Up to 50 matches are returned (at most 500 via `max_results`) with file path, 1-based line and byte column, the matching line, and two lines of context before and after (`context_lines`, 0 through 10). Reaching `max_results`, the 64 KiB structured-output limit, or the search time limit (`timeout_seconds`, 1 through 300) sets `meta.truncated` with a warning; a timeout with partial results returns them, and a timeout without results returns `SEARCH_TIMEOUT`. The `include` and `exclude` glob patterns restrict or skip paths, and always exclude `.git`. Binary files (a NUL byte or invalid UTF-8) and files larger than 1 MiB (`GOGS_MCP_MAX_FILE_BYTES`) are skipped and reported in warnings. Repeat searches for the same commit set `meta.cache_hit` and do not contact Gogs again.
 
 The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) are expired and the least recently used snapshots are removed when the per-user cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`), before a new download starts. Snapshots held by an active search are never evicted; when no room can be made, the search fails with `CACHE_CAPACITY_EXCEEDED` instead of downloading. `gogs-mcp cache clean` removes the authenticated user's snapshot cache and `gogs-mcp cache clean --all` removes every verified cache root; configuration, tokens, and anything outside the cache root are never touched.
+
+Gogs issues track repository-internal discussion; Jira remains the requirements system of record, and this server does not sync with Jira. `list_issues` accepts only the `open` and `closed` states because Gogs v0.14.2 treats every other value as open, and it does not accept a page size because Gogs v0.14.2 fixes it server-side. The next page comes from the Gogs `Link` header and is reported as `meta.next_page` only when one exists. `list_issues` returns compact summaries without bodies; `get_issue` returns the full record with body, creator, assignee, labels, milestone, comment count, and timestamps, and reports the shared not-found code without revealing whether the repository or the issue exists. `list_issue_comments` validates the RFC3339 `since` timestamp before contacting Gogs, and bounds the result with `max_comments` (default 100, at most 500) and the 64 KiB structured-output limit; reaching either bound sets `meta.truncated` with a warning.
 
 ## Configure credentials
 

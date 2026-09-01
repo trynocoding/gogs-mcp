@@ -28,6 +28,9 @@ type Client interface {
 	GetCommit(context.Context, string, string, string) (gogs.Commit, error)
 	ResolveCommitSHA(context.Context, string, string, string) (string, error)
 	DownloadArchive(context.Context, string, string, string) (io.ReadCloser, error)
+	ListIssues(context.Context, string, string, string, int) ([]gogs.IssueSummary, int, error)
+	GetIssue(context.Context, string, string, int64) (gogs.Issue, error)
+	ListIssueComments(context.Context, string, string, int64, string) ([]gogs.IssueComment, error)
 }
 
 type Server struct {
@@ -94,6 +97,7 @@ func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search
 	registerContentTools(server, client)
 	registerGitTools(server, client)
 	registerSearchTools(server, client, snapshots, &identityCache{}, search)
+	registerIssueTools(server, client)
 
 	return &Server{mcp: server}
 }

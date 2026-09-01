@@ -147,3 +147,65 @@ type SearchPage struct {
 	Mode      string        `json:"mode"`
 	Matches   []SearchMatch `json:"matches"`
 }
+
+type IssueUser struct {
+	Username string `json:"username"`
+	FullName string `json:"full_name"`
+}
+
+type IssueLabel struct {
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
+type IssueMilestone struct {
+	Title string `json:"title"`
+	State string `json:"state"`
+}
+
+// IssueSummary is the compact issue listing entry; bodies are only returned
+// by get_issue to keep listing output bounded.
+type IssueSummary struct {
+	Number      int64        `json:"number"`
+	Title       string       `json:"title"`
+	State       string       `json:"state"`
+	User        IssueUser    `json:"user"`
+	Labels      []IssueLabel `json:"labels"`
+	NumComments int          `json:"num_comments"`
+	CreatedAt   string       `json:"created_at"`
+	UpdatedAt   string       `json:"updated_at"`
+}
+
+type IssuePage struct {
+	Issues []IssueSummary `json:"issues"`
+	State  string         `json:"state"`
+	Page   int            `json:"page"`
+}
+
+type Issue struct {
+	Number      int64           `json:"number"`
+	Title       string          `json:"title"`
+	Body        string          `json:"body"`
+	State       string          `json:"state"`
+	User        IssueUser       `json:"user"`
+	Assignee    *IssueUser      `json:"assignee,omitempty"`
+	Labels      []IssueLabel    `json:"labels"`
+	Milestone   *IssueMilestone `json:"milestone,omitempty"`
+	NumComments int             `json:"num_comments"`
+	CreatedAt   string          `json:"created_at"`
+	UpdatedAt   string          `json:"updated_at"`
+}
+
+type IssueComment struct {
+	ID        int64     `json:"id"`
+	User      IssueUser `json:"user"`
+	Body      string    `json:"body"`
+	CreatedAt string    `json:"created_at"`
+	UpdatedAt string    `json:"updated_at"`
+}
+
+type IssueCommentPage struct {
+	Comments []IssueComment `json:"comments"`
+	Since    string         `json:"since,omitempty"`
+	Max      int            `json:"max_comments"`
+}

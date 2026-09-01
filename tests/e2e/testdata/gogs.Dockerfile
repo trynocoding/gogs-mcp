@@ -25,6 +25,11 @@ RUN --mount=type=cache,id=gogs-mcp-smoke-modules,target=/go/pkg/mod \
     CGO_ENABLED=0 GOPROXY="$GOGS_GOPROXY" go build \
     -trimpath \
     -o /out/gogs-e2e-repositories ./internal/e2erepositories
+RUN --mount=type=cache,id=gogs-mcp-smoke-modules,target=/go/pkg/mod \
+    --mount=type=cache,id=gogs-mcp-smoke-build,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOPROXY="$GOGS_GOPROXY" go build \
+    -trimpath \
+    -o /out/gogs-e2e-issues ./internal/e2eissues
 
 FROM alpine:3.22
 
@@ -37,6 +42,7 @@ WORKDIR /app
 COPY --from=builder /out/gogs /app/gogs
 COPY --from=builder /out/gogs-e2e-bootstrap /app/gogs-e2e-bootstrap
 COPY --from=builder /out/gogs-e2e-repositories /app/gogs-e2e-repositories
+COPY --from=builder /out/gogs-e2e-issues /app/gogs-e2e-issues
 
 EXPOSE 3000
 ENTRYPOINT ["/app/gogs"]

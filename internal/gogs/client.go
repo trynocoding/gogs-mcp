@@ -148,6 +148,14 @@ func (c *Client) getJSON(ctx context.Context, destination any, pathSegments ...s
 }
 
 func (c *Client) getJSONWithQuery(ctx context.Context, destination any, query url.Values, pathSegments ...string) error {
+	_, err := c.getJSONWithHeaders(ctx, destination, query, pathSegments...)
+	return err
+}
+
+// getJSONWithHeaders behaves like getJSONWithQuery and additionally returns
+// the response headers of the successful request, for example to follow
+// pagination Link headers.
+func (c *Client) getJSONWithHeaders(ctx context.Context, destination any, query url.Values, pathSegments ...string) (http.Header, error) {
 	requestURL := c.apiRoot.JoinPath(escapedPathSegments(pathSegments)...)
 	requestURL.RawQuery = query.Encode()
 
@@ -155,21 +163,21 @@ func (c *Client) getJSONWithQuery(ctx context.Context, destination any, query ur
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
 			if err := waitForRetry(ctx, attempt); err != nil {
-				return classifyTransportError(err)
+				return nil, classifyTransportError(err)
 			}
 		}
 		started := time.Now()
-		status, body, err := c.getOnce(ctx, requestURL)
+		status, header, body, err := c.getOnce(ctx, requestURL)
 		if err != nil {
 			var gogsError *Error
 			if errors.As(err, &gogsError) {
 				c.logRequest(ctx, status, time.Since(started), gogsError.Code)
-				return gogsError
+				return nil, gogsError
 			}
 			classified := classifyTransportError(err)
 			c.logRequest(ctx, status, time.Since(started), classified.Code)
 			if classified.Code == CodeTLSError || classified.Code == CodeTimeout || attempt == 2 {
-				return classified
+				return nil, classified
 			}
 			lastError = classified
 			continue
@@ -181,20 +189,20 @@ func (c *Client) getJSONWithQuery(ctx context.Context, destination any, query ur
 				lastError = classified
 				continue
 			}
-			return classified
+			return nil, classified
 		}
 		if err := json.Unmarshal(body, destination); err != nil {
 			c.logRequest(ctx, status, time.Since(started), CodeGogsError)
-			return &Error{
+			return nil, &Error{
 				Code:    CodeGogsError,
 				Message: "Gogs returned invalid JSON.",
 				cause:   err,
 			}
 		}
 		c.logRequest(ctx, status, time.Since(started), "")
-		return nil
+		return header, nil
 	}
-	return lastError
+	return nil, lastError
 }
 
 func (c *Client) logRequest(ctx context.Context, status int, duration time.Duration, code ErrorCode) {
@@ -209,10 +217,10 @@ func (c *Client) logRequest(ctx context.Context, status int, duration time.Durat
 	)
 }
 
-func (c *Client) getOnce(ctx context.Context, requestURL *url.URL) (int, []byte, error) {
+func (c *Client) getOnce(ctx context.Context, requestURL *url.URL) (int, http.Header, []byte, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 	if err != nil {
-		return 0, nil, errors.Wrap(err, "create Gogs request")
+		return 0, nil, nil, errors.Wrap(err, "create Gogs request")
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Authorization", "token "+c.token)
@@ -220,24 +228,24 @@ func (c *Client) getOnce(ctx context.Context, requestURL *url.URL) (int, []byte,
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes+1))
 	closeErr := response.Body.Close()
 	if readErr != nil {
-		return 0, nil, errors.Wrap(readErr, "read Gogs response")
+		return 0, nil, nil, errors.Wrap(readErr, "read Gogs response")
 	}
 	if closeErr != nil {
-		return 0, nil, errors.Wrap(closeErr, "close Gogs response")
+		return 0, nil, nil, errors.Wrap(closeErr, "close Gogs response")
 	}
 	if len(body) > maxJSONResponseBytes {
-		return 0, nil, &Error{
+		return 0, nil, nil, &Error{
 			Code:    CodeResponseTooLarge,
 			Message: "The Gogs response exceeded the 8 MiB limit.",
 		}
 	}
-	return response.StatusCode, body, nil
+	return response.StatusCode, response.Header, body, nil
 }
 
 func waitForRetry(ctx context.Context, attempt int) error {

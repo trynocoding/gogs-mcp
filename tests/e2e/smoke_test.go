@@ -352,9 +352,19 @@ func addSmokeBuildFiles(projectRoot, buildContext string) error {
 	if err := os.MkdirAll(repositoriesDirectory, 0o755); err != nil {
 		return errors.Wrap(err, "create repository bootstrap source directory")
 	}
-	return copyFile(
+	if err := copyFile(
 		filepath.Join(testdata, "repositories-bootstrap", "main.go"),
 		filepath.Join(repositoriesDirectory, "main.go"),
+	); err != nil {
+		return err
+	}
+	issuesDirectory := filepath.Join(buildContext, "internal", "e2eissues")
+	if err := os.MkdirAll(issuesDirectory, 0o755); err != nil {
+		return errors.Wrap(err, "create issues bootstrap source directory")
+	}
+	return copyFile(
+		filepath.Join(testdata, "issues-bootstrap", "main.go"),
+		filepath.Join(issuesDirectory, "main.go"),
 	)
 }
 
@@ -564,6 +574,9 @@ func useMCPClientWithCache(t *testing.T, projectRoot, baseURL, token, cacheDir s
 		"list_commits",
 		"get_commit",
 		"search_code",
+		"list_issues",
+		"get_issue",
+		"list_issue_comments",
 	}, names)
 	action(session)
 	require.NoError(t, session.Close())

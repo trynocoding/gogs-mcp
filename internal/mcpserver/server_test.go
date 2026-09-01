@@ -56,6 +56,21 @@ type fakeClient struct {
 	archiveCalls     int
 	archiveSHA       string
 	archiveBody      func() (io.ReadCloser, error)
+	issueSummaries   []gogs.IssueSummary
+	issueNextPage    int
+	listIssuesErr    error
+	listIssuesCalls  int
+	listIssuesState  string
+	listIssuesPage   int
+	issue            gogs.Issue
+	getIssueErr      error
+	getIssueCalls    int
+	getIssueNumber   int64
+	issueComments    []gogs.IssueComment
+	commentsErr      error
+	commentsCalls    int
+	commentsNumber   int64
+	commentsSince    string
 }
 
 func (c *fakeClient) GetAuthenticatedUser(context.Context) (gogs.User, error) {
@@ -127,6 +142,26 @@ func (c *fakeClient) DownloadArchive(_ context.Context, _, _, sha string) (io.Re
 	return nil, cockroacherrors.New("unexpected archive download")
 }
 
+func (c *fakeClient) ListIssues(_ context.Context, _, _, state string, page int) ([]gogs.IssueSummary, int, error) {
+	c.listIssuesCalls++
+	c.listIssuesState = state
+	c.listIssuesPage = page
+	return c.issueSummaries, c.issueNextPage, c.listIssuesErr
+}
+
+func (c *fakeClient) GetIssue(_ context.Context, _, _ string, number int64) (gogs.Issue, error) {
+	c.getIssueCalls++
+	c.getIssueNumber = number
+	return c.issue, c.getIssueErr
+}
+
+func (c *fakeClient) ListIssueComments(_ context.Context, _, _ string, number int64, since string) ([]gogs.IssueComment, error) {
+	c.commentsCalls++
+	c.commentsNumber = number
+	c.commentsSince = since
+	return c.issueComments, c.commentsErr
+}
+
 func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 	session := connectTestClient(t, &fakeClient{user: gogs.User{
 		ID:       42,
@@ -137,7 +172,7 @@ func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 
 	list, err := session.ListTools(context.Background(), nil)
 	require.NoError(t, err)
-	require.Len(t, list.Tools, 11)
+	require.Len(t, list.Tools, 14)
 	tool := findTool(t, list.Tools, "get_authenticated_user")
 	require.NotNil(t, tool.Annotations)
 	assert.True(t, tool.Annotations.ReadOnlyHint)
