@@ -206,18 +206,31 @@ func (c *Client) getJSONWithHeaders(ctx context.Context, destination any, query 
 	return nil, lastError
 }
 
-// postJSON sends one POST request with a JSON payload and decodes the JSON
+// postJSON sends a POST request. A write is never retried automatically: any
+// failure that leaves the server-side outcome ambiguous is reported as
+// WRITE_OUTCOME_UNKNOWN so callers can verify the result before repeating it.
+func (c *Client) postJSON(ctx context.Context, destination any, payload any, pathSegments ...string) error {
+	return c.writeJSON(ctx, http.MethodPost, destination, payload, pathSegments...)
+}
+
+// patchJSON sends a PATCH request under the same no-retry write semantics as
+// postJSON.
+func (c *Client) patchJSON(ctx context.Context, destination any, payload any, pathSegments ...string) error {
+	return c.writeJSON(ctx, http.MethodPatch, destination, payload, pathSegments...)
+}
+
+// writeJSON sends one write request with a JSON payload and decodes the JSON
 // response. Unlike the GET helpers it never retries: a write that may have
 // reached Gogs must not be repeated, so every failure is classified as
 // either a definitive rejection (nothing was written) or
 // WRITE_OUTCOME_UNKNOWN (the result must be queried before retrying).
-func (c *Client) postJSON(ctx context.Context, destination any, payload any, pathSegments ...string) error {
+func (c *Client) writeJSON(ctx context.Context, method string, destination any, payload any, pathSegments ...string) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return errors.Wrap(err, "encode Gogs request payload")
 	}
 	requestURL := c.apiRoot.JoinPath(escapedPathSegments(pathSegments)...)
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(payloadBytes))
+	request, err := http.NewRequestWithContext(ctx, method, requestURL.String(), bytes.NewReader(payloadBytes))
 	if err != nil {
 		return errors.Wrap(err, "create Gogs request")
 	}

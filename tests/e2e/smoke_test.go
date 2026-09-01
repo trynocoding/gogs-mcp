@@ -542,9 +542,9 @@ var e2eToolNames = []string{
 	"list_issue_comments",
 }
 
-// e2eWritingToolNames additionally contains create_issue, which is only
-// registered when GOGS_MCP_WRITE_ENABLED is set.
-var e2eWritingToolNames = slices.Concat(e2eToolNames, []string{"create_issue"})
+// e2eWritingToolNames additionally contains the issue writing tools, which
+// are only registered when GOGS_MCP_WRITE_ENABLED is set.
+var e2eWritingToolNames = slices.Concat(e2eToolNames, []string{"create_issue", "update_issue", "create_issue_comment"})
 
 // useMCPClientWithOptions starts the stdio server with extra environment
 // variables and asserts the exact advertised tool list before running action.

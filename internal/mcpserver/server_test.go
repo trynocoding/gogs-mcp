@@ -17,71 +17,81 @@ import (
 )
 
 type fakeClient struct {
-	user             gogs.User
-	userErr          error
-	userCalls        int
-	repositories     []gogs.Repository
-	listErr          error
-	repository       gogs.Repository
-	getErr           error
-	listCalls        int
-	getCalls         int
-	requestedOwner   string
-	requestedRepo    string
-	directoryEntries []gogs.ContentEntry
-	directoryRef     string
-	directoryErr     error
-	directoryCalls   int
-	directoryPath    string
-	file             gogs.FileContent
-	fileErr          error
-	fileCalls        int
-	filePath         string
-	contentRef       string
-	branches         []gogs.Branch
-	branch           gogs.Branch
-	branchErr        error
-	branchCalls      int
-	branchName       string
-	commits          []gogs.Commit
-	commitLimit      int
-	commitErr        error
-	commitCalls      int
-	commit           gogs.Commit
-	commitSHA        string
-	resolvedSHA      string
-	resolveErr       error
-	resolveCalls     int
-	resolveRef       string
-	archiveCalls     int
-	archiveSHA       string
-	archiveBody      func() (io.ReadCloser, error)
-	issueSummaries   []gogs.IssueSummary
-	issueNextPage    int
-	listIssuesErr    error
-	listIssuesCalls  int
-	listIssuesState  string
-	listIssuesPage   int
-	issue            gogs.Issue
-	getIssueErr      error
-	getIssueCalls    int
-	getIssueNumber   int64
-	issueComments    []gogs.IssueComment
-	commentsErr      error
-	commentsCalls    int
-	commentsNumber   int64
-	commentsSince    string
-	repoLabels       []gogs.RepositoryLabel
-	repoLabelErr     error
-	repoMilestones   []gogs.RepositoryMilestone
-	repoMilestoneErr error
-	userExists       bool
-	userExistsErr    error
-	userExistsCalls  int
-	createdIssue     gogs.Issue
-	createIssueErr   error
-	createIssueCalls int
-	createdOptions   gogs.CreateIssueOptions
+	user               gogs.User
+	userErr            error
+	userCalls          int
+	repositories       []gogs.Repository
+	listErr            error
+	repository         gogs.Repository
+	getErr             error
+	listCalls          int
+	getCalls           int
+	requestedOwner     string
+	requestedRepo      string
+	directoryEntries   []gogs.ContentEntry
+	directoryRef       string
+	directoryErr       error
+	directoryCalls     int
+	directoryPath      string
+	file               gogs.FileContent
+	fileErr            error
+	fileCalls          int
+	filePath           string
+	contentRef         string
+	branches           []gogs.Branch
+	branch             gogs.Branch
+	branchErr          error
+	branchCalls        int
+	branchName         string
+	commits            []gogs.Commit
+	commitLimit        int
+	commitErr          error
+	commitCalls        int
+	commit             gogs.Commit
+	commitSHA          string
+	resolvedSHA        string
+	resolveErr         error
+	resolveCalls       int
+	resolveRef         string
+	archiveCalls       int
+	archiveSHA         string
+	archiveBody        func() (io.ReadCloser, error)
+	issueSummaries     []gogs.IssueSummary
+	issueNextPage      int
+	listIssuesErr      error
+	listIssuesCalls    int
+	listIssuesState    string
+	listIssuesPage     int
+	issue              gogs.Issue
+	getIssueErr        error
+	getIssueCalls      int
+	getIssueNumber     int64
+	issueComments      []gogs.IssueComment
+	commentsErr        error
+	commentsCalls      int
+	commentsNumber     int64
+	commentsSince      string
+	repoLabels         []gogs.RepositoryLabel
+	repoLabelErr       error
+	repoMilestones     []gogs.RepositoryMilestone
+	repoMilestoneErr   error
+	userExists         bool
+	userExistsErr      error
+	userExistsCalls    int
+	createdIssue       gogs.Issue
+	createIssueErr     error
+	createIssueCalls   int
+	createdOptions     gogs.CreateIssueOptions
+	updatedIssue       gogs.Issue
+	updateIssueErr     error
+	updateIssueCalls   int
+	updatedNumber      int64
+	updatedOptions     gogs.UpdateIssueOptions
+	createdComment     gogs.IssueComment
+	createCommentErr   error
+	createCommentCalls int
+	commentedNumber    int64
+	commentedBody      string
 }
 
 func (c *fakeClient) GetAuthenticatedUser(context.Context) (gogs.User, error) {
@@ -190,6 +200,20 @@ func (c *fakeClient) CreateIssue(_ context.Context, _, _ string, options gogs.Cr
 	c.createIssueCalls++
 	c.createdOptions = options
 	return c.createdIssue, c.createIssueErr
+}
+
+func (c *fakeClient) UpdateIssue(_ context.Context, _, _ string, number int64, options gogs.UpdateIssueOptions) (gogs.Issue, error) {
+	c.updateIssueCalls++
+	c.updatedNumber = number
+	c.updatedOptions = options
+	return c.updatedIssue, c.updateIssueErr
+}
+
+func (c *fakeClient) CreateIssueComment(_ context.Context, _, _ string, number int64, body string) (gogs.IssueComment, error) {
+	c.createCommentCalls++
+	c.commentedNumber = number
+	c.commentedBody = body
+	return c.createdComment, c.createCommentErr
 }
 
 func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {

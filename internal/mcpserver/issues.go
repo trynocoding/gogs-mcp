@@ -54,6 +54,27 @@ type createIssueInput struct {
 	Milestone string   `json:"milestone,omitempty"`
 }
 
+// updateIssueInput keeps optional fields as pointers so that an omitted field
+// (nil) means "keep the current value" while an explicit value — including an
+// empty string, which clears the assignee or milestone — is sent to Gogs.
+type updateIssueInput struct {
+	Owner     string  `json:"owner"`
+	Repo      string  `json:"repo"`
+	Number    int64   `json:"number"`
+	Title     *string `json:"title,omitempty"`
+	Body      *string `json:"body,omitempty"`
+	Assignee  *string `json:"assignee,omitempty"`
+	Milestone *string `json:"milestone,omitempty"`
+	State     string  `json:"state,omitempty"`
+}
+
+type createIssueCommentInput struct {
+	Owner  string `json:"owner"`
+	Repo   string `json:"repo"`
+	Number int64  `json:"number"`
+	Body   string `json:"body"`
+}
+
 func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_issues",
@@ -158,7 +179,7 @@ func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "create_issue",
 		Description: "Create an issue in a Gogs repository with a title and an optional body. An assignee, labels, or a milestone requires repository write access and is verified to exist before the issue is created. " + issueToolScope,
-		Annotations: writeAnnotations("Create issue"),
+		Annotations: writeAnnotations("Create issue", false),
 		InputSchema: createIssueInputSchema(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input createIssueInput) (*mcp.CallToolResult, ToolResponse[Issue], error) {
 		requestID := newRequestID()
@@ -175,6 +196,55 @@ func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 		}
 		output := mapIssue(issue)
 		return nil, ToolResponse[Issue]{
+			Data: &output,
+			Meta: ResponseMeta{RequestID: requestID},
+		}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "update_issue",
+		Description: "Update an issue in a Gogs repository. The issue author may change the title, body, and state; the assignee or milestone additionally requires repository write access and is verified to exist before the update is sent. Omitted fields keep their current value, and an empty assignee or milestone clears it. " + issueToolScope,
+		Annotations: writeAnnotations("Update issue", true),
+		InputSchema: updateIssueInputSchema(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input updateIssueInput) (*mcp.CallToolResult, ToolResponse[Issue], error) {
+		requestID := newRequestID()
+		ctx = gogs.WithRequestMetadata(ctx, requestID, "update_issue")
+		options, toolErr := resolveUpdateIssueInput(ctx, client, input)
+		if toolErr != nil {
+			result, response := issueError(requestID, toolErr)
+			return result, response, nil
+		}
+		issue, err := client.UpdateIssue(ctx, input.Owner, input.Repo, input.Number, options)
+		if err != nil {
+			result, response := issueError(requestID, err)
+			return result, response, nil
+		}
+		output := mapIssue(issue)
+		return nil, ToolResponse[Issue]{
+			Data: &output,
+			Meta: ResponseMeta{RequestID: requestID},
+		}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "create_issue_comment",
+		Description: "Add a comment to a Gogs issue as the authenticated user. " + issueToolScope,
+		Annotations: writeAnnotations("Create issue comment", false),
+		InputSchema: createIssueCommentInputSchema(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input createIssueCommentInput) (*mcp.CallToolResult, ToolResponse[IssueComment], error) {
+		requestID := newRequestID()
+		ctx = gogs.WithRequestMetadata(ctx, requestID, "create_issue_comment")
+		if err := validateCommentBody(input.Body); err != nil {
+			result, response := issueCommentError(requestID, err)
+			return result, response, nil
+		}
+		comment, err := client.CreateIssueComment(ctx, input.Owner, input.Repo, input.Number, input.Body)
+		if err != nil {
+			result, response := issueCommentError(requestID, err)
+			return result, response, nil
+		}
+		output := mapIssueComment(comment)
+		return nil, ToolResponse[IssueComment]{
 			Data: &output,
 			Meta: ResponseMeta{RequestID: requestID},
 		}, nil
@@ -297,6 +367,123 @@ func resolveCreateIssueInput(ctx context.Context, client Client, input createIss
 	return options, nil
 }
 
+// resolveUpdateIssueInput validates the update fields locally and resolves the
+// managed references against Gogs. An update that touches no field is rejected
+// before Gogs is contacted. The issue author may change the title, body, and
+// state, but Gogs silently ignores assignee and milestone changes from users
+// without repository write access, so those fields first require repository
+// push permission and every reference is verified to exist before the update
+// is sent.
+func resolveUpdateIssueInput(ctx context.Context, client Client, input updateIssueInput) (gogs.UpdateIssueOptions, *gogs.Error) {
+	options := gogs.UpdateIssueOptions{}
+	updates := 0
+	if input.Title != nil {
+		updates++
+		if utf8.RuneCountInString(*input.Title) > maxIssueTitleRunes {
+			return gogs.UpdateIssueOptions{}, &gogs.Error{
+				Code:    gogs.CodeInvalidArgument,
+				Message: errors.Newf("title must be at most %d characters", maxIssueTitleRunes).Error(),
+			}
+		}
+		options.Title = *input.Title
+	}
+	if input.Body != nil {
+		updates++
+		if len(*input.Body) > maxIssueBodyBytes {
+			return gogs.UpdateIssueOptions{}, &gogs.Error{
+				Code:    gogs.CodeInvalidArgument,
+				Message: errors.Newf("body must be at most %d bytes", maxIssueBodyBytes).Error(),
+			}
+		}
+		options.Body = input.Body
+	}
+	if input.State != "" {
+		updates++
+		state := input.State
+		options.State = &state
+	}
+	if input.Assignee == nil && input.Milestone == nil {
+		if updates == 0 {
+			return gogs.UpdateIssueOptions{}, &gogs.Error{
+				Code:    gogs.CodeInvalidArgument,
+				Message: "Provide at least one of title, body, assignee, milestone, or state to update.",
+			}
+		}
+		return options, nil
+	}
+
+	repository, err := client.GetRepository(ctx, input.Owner, input.Repo)
+	if err != nil {
+		return gogs.UpdateIssueOptions{}, gogs.AsError(err)
+	}
+	if !repository.Permissions.Push {
+		return gogs.UpdateIssueOptions{}, &gogs.Error{
+			Code:    gogs.CodePermissionDenied,
+			Message: "Changing the assignee or milestone requires repository write access; update the title, body, or state instead.",
+		}
+	}
+
+	if input.Assignee != nil {
+		if *input.Assignee != "" {
+			exists, err := client.UserExists(ctx, *input.Assignee)
+			if err != nil {
+				return gogs.UpdateIssueOptions{}, gogs.AsError(err)
+			}
+			if !exists {
+				return gogs.UpdateIssueOptions{}, &gogs.Error{
+					Code:    gogs.CodeInvalidArgument,
+					Message: errors.Newf("the assignee %q does not exist", *input.Assignee).Error(),
+				}
+			}
+		}
+		options.Assignee = input.Assignee
+	}
+
+	if input.Milestone != nil {
+		if *input.Milestone != "" {
+			milestones, err := client.ListRepositoryMilestones(ctx, input.Owner, input.Repo)
+			if err != nil {
+				return gogs.UpdateIssueOptions{}, gogs.AsError(err)
+			}
+			var milestoneID int64
+			for _, milestone := range milestones {
+				if milestone.Title == *input.Milestone {
+					milestoneID = milestone.ID
+					break
+				}
+			}
+			if milestoneID == 0 {
+				return gogs.UpdateIssueOptions{}, &gogs.Error{
+					Code:    gogs.CodeInvalidArgument,
+					Message: errors.Newf("the milestone %q does not exist in %s/%s", *input.Milestone, input.Owner, input.Repo).Error(),
+				}
+			}
+			options.Milestone = &milestoneID
+		} else {
+			cleared := int64(0)
+			options.Milestone = &cleared
+		}
+	}
+
+	return options, nil
+}
+
+// validateCommentBody enforces the comment body bounds before Gogs is
+// contacted: an empty body is a pointless write and an oversized one would be
+// rejected after content was already transmitted.
+func validateCommentBody(body string) *gogs.Error {
+	if body == "" {
+		return &gogs.Error{Code: gogs.CodeInvalidArgument, Message: "The comment body must not be empty."}
+	}
+	if len(body) > maxIssueBodyBytes {
+		return &gogs.Error{
+			Code:    gogs.CodeInvalidArgument,
+			Message: errors.Newf("body must be at most %d bytes", maxIssueBodyBytes).Error(),
+		}
+	}
+	return nil
+}
+
 func mapIssueSummaries(issues []gogs.IssueSummary) []IssueSummary {
 	mapped := make([]IssueSummary, len(issues))
 	for index, issue := range issues {
@@ -343,15 +530,19 @@ func mapIssue(issue gogs.Issue) Issue {
 func mapIssueComments(comments []gogs.IssueComment) []IssueComment {
 	mapped := make([]IssueComment, len(comments))
 	for index, comment := range comments {
-		mapped[index] = IssueComment{
-			ID:        comment.ID,
-			User:      mapIssueUser(comment.User),
-			Body:      comment.Body,
-			CreatedAt: comment.CreatedAt,
-			UpdatedAt: comment.UpdatedAt,
-		}
+		mapped[index] = mapIssueComment(comment)
 	}
 	return mapped
+}
+
+func mapIssueComment(comment gogs.IssueComment) IssueComment {
+	return IssueComment{
+		ID:        comment.ID,
+		User:      mapIssueUser(comment.User),
+		Body:      comment.Body,
+		CreatedAt: comment.CreatedAt,
+		UpdatedAt: comment.UpdatedAt,
+	}
 }
 
 func mapIssueUser(user gogs.User) IssueUser {
@@ -411,6 +602,14 @@ func issueError(requestID string, err error) (*mcp.CallToolResult, ToolResponse[
 func issueCommentPageError(requestID string, err error) (*mcp.CallToolResult, ToolResponse[IssueCommentPage]) {
 	classified := gogs.AsError(err)
 	return &mcp.CallToolResult{IsError: true}, ToolResponse[IssueCommentPage]{
+		Error: mapToolError(classified),
+		Meta:  ResponseMeta{RequestID: requestID},
+	}
+}
+
+func issueCommentError(requestID string, err error) (*mcp.CallToolResult, ToolResponse[IssueComment]) {
+	classified := gogs.AsError(err)
+	return &mcp.CallToolResult{IsError: true}, ToolResponse[IssueComment]{
 		Error: mapToolError(classified),
 		Meta:  ResponseMeta{RequestID: requestID},
 	}
@@ -481,10 +680,55 @@ func createIssueInputSchema() *jsonschema.Schema {
 	}, []string{"owner", "repo", "title"})
 }
 
+func updateIssueInputSchema() *jsonschema.Schema {
+	return objectSchema(map[string]*jsonschema.Schema{
+		"owner":  stringSchema("Repository owner username.", true, false),
+		"repo":   stringSchema("Repository name.", true, false),
+		"number": integerSchema("Issue number.", 1, 0),
+		"title": {
+			Type:        "string",
+			Description: "New issue title.",
+			MinLength:   intPointer(1),
+			MaxLength:   intPointer(maxIssueTitleRunes),
+		},
+		"body": {
+			Type:        "string",
+			Description: "New issue body in Markdown. An empty string clears the body.",
+		},
+		"assignee": {
+			Type:        "string",
+			Description: "Username to assign the issue to. Requires repository write access; an empty string clears the assignee.",
+		},
+		"milestone": {
+			Type:        "string",
+			Description: "Title of the milestone to assign. Requires repository write access and the title must exist; an empty string clears the milestone.",
+		},
+		"state": {
+			Type:        "string",
+			Description: "New issue state.",
+			Enum:        []any{gogs.IssueStateOpen, gogs.IssueStateClosed},
+		},
+	}, []string{"owner", "repo", "number"})
+}
+
+func createIssueCommentInputSchema() *jsonschema.Schema {
+	return objectSchema(map[string]*jsonschema.Schema{
+		"owner":  stringSchema("Repository owner username.", true, false),
+		"repo":   stringSchema("Repository name.", true, false),
+		"number": integerSchema("Issue number.", 1, 0),
+		"body": {
+			Type:        "string",
+			Description: "Comment body in Markdown.",
+			MinLength:   intPointer(1),
+		},
+	}, []string{"owner", "repo", "number", "body"})
+}
+
 // writeAnnotations mirrors readOnlyAnnotations for tools that change Gogs
-// state: the write is not read-only, not idempotent, and not destructive.
-func writeAnnotations(title string) *mcp.ToolAnnotations {
-	destructive := false
+// state: the write is neither read-only nor idempotent, and the destructive
+// hint distinguishes updates that replace existing content from additive
+// writes.
+func writeAnnotations(title string, destructive bool) *mcp.ToolAnnotations {
 	openWorld := true
 	return &mcp.ToolAnnotations{
 		DestructiveHint: &destructive,

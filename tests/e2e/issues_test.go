@@ -120,6 +120,11 @@ type issueCommentPageResponse struct {
 	Meta  *responseMeta     `json:"meta,omitempty"`
 }
 
+type issueCommentResponse struct {
+	Data  *issueComment `json:"data,omitempty"`
+	Error *toolError    `json:"error,omitempty"`
+}
+
 func TestIssues(t *testing.T) {
 	environment, projectRoot, identifier := prepareSmokeEnvironment(t)
 	commandContext, cancelCommands := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -443,6 +448,113 @@ func TestIssueWriting(t *testing.T) {
 		decodeStructuredContent(t, denied.StructuredContent, &deniedResponse)
 		require.NotNil(t, deniedResponse.Error)
 		assert.Equal(t, "PERMISSION_DENIED", deniedResponse.Error.Code)
+
+		t.Log("Maintaining the created issue: rename, comment, close, and reopen.")
+		updated := callE2ETool(t, session, "update_issue", map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": created.Data.Number,
+			"title":  "Reader-reported parser crash (renamed)",
+			"body":   "The crash reproduces on empty input.",
+		})
+		var updatedIssue issueResponse
+		decodeStructuredContent(t, updated.StructuredContent, &updatedIssue)
+		require.NotNil(t, updatedIssue.Data)
+		assert.Equal(t, "Reader-reported parser crash (renamed)", updatedIssue.Data.Title)
+		assert.Equal(t, "The crash reproduces on empty input.", updatedIssue.Data.Body)
+
+		commented := callE2ETool(t, session, "create_issue_comment", map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": created.Data.Number,
+			"body":   "The crash reproduces on empty input.",
+		})
+		var comment issueCommentResponse
+		decodeStructuredContent(t, commented.StructuredContent, &comment)
+		require.NotNil(t, comment.Data)
+		assert.Equal(t, bootstrap.Reader.Username, comment.Data.User.Username)
+		assert.Equal(t, "The crash reproduces on empty input.", comment.Data.Body)
+		assert.NotEmpty(t, comment.Data.CreatedAt)
+
+		closed := callE2ETool(t, session, "update_issue", map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": created.Data.Number,
+			"state":  "closed",
+		})
+		var closedIssue issueResponse
+		decodeStructuredContent(t, closed.StructuredContent, &closedIssue)
+		require.NotNil(t, closedIssue.Data)
+		assert.Equal(t, "closed", closedIssue.Data.State)
+
+		reopened := callE2ETool(t, session, "update_issue", map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": created.Data.Number,
+			"state":  "open",
+		})
+		var reopenedIssue issueResponse
+		decodeStructuredContent(t, reopened.StructuredContent, &reopenedIssue)
+		require.NotNil(t, reopenedIssue.Data)
+		assert.Equal(t, "open", reopenedIssue.Data.State)
+
+		t.Log("Re-reading the final issue state and comments from Gogs.")
+		finalDetail := callIssue(t, session, map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": created.Data.Number,
+		})
+		require.NotNil(t, finalDetail.Data)
+		assert.Equal(t, "Reader-reported parser crash (renamed)", finalDetail.Data.Title)
+		assert.Equal(t, "The crash reproduces on empty input.", finalDetail.Data.Body)
+		assert.Equal(t, "open", finalDetail.Data.State)
+		require.Empty(t, finalDetail.Data.Labels)
+		assert.Nil(t, finalDetail.Data.Milestone)
+
+		commentList := callE2ETool(t, session, "list_issue_comments", map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": created.Data.Number,
+		})
+		var comments issueCommentPageResponse
+		decodeStructuredContent(t, commentList.StructuredContent, &comments)
+		require.NotNil(t, comments.Data)
+		// Gogs records the close and reopen as system comments with an empty
+		// body and lists them alongside authored comments.
+		require.Len(t, comments.Data.Comments, 3)
+		var authored *issueComment
+		for index := range comments.Data.Comments {
+			if comments.Data.Comments[index].ID == comment.Data.ID {
+				authored = &comments.Data.Comments[index]
+				break
+			}
+		}
+		require.NotNil(t, authored, "the created comment must appear in the issue comment list")
+		assert.Equal(t, bootstrap.Reader.Username, authored.User.Username)
+		assert.Equal(t, "The crash reproduces on empty input.", authored.Body)
+
+		t.Log("Verifying that managed updates require write access and foreign updates are rejected.")
+		assigneeDenied := callE2ETool(t, session, "update_issue", map[string]any{
+			"owner":    bootstrap.User.Username,
+			"repo":     bootstrap.Repository,
+			"number":   created.Data.Number,
+			"assignee": bootstrap.User.Username,
+		})
+		var assigneeDeniedIssue issueResponse
+		decodeStructuredContent(t, assigneeDenied.StructuredContent, &assigneeDeniedIssue)
+		require.NotNil(t, assigneeDeniedIssue.Error)
+		assert.Equal(t, "PERMISSION_DENIED", assigneeDeniedIssue.Error.Code)
+
+		foreign := callE2ETool(t, session, "update_issue", map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": bootstrap.OpenIssueNumber,
+			"title":  "Hijacked title",
+		})
+		var foreignIssue issueResponse
+		decodeStructuredContent(t, foreign.StructuredContent, &foreignIssue)
+		require.NotNil(t, foreignIssue.Error)
+		assert.Equal(t, "PERMISSION_DENIED", foreignIssue.Error.Code)
 	})
 	assertNoSecrets(t, readerWriteLogs, bootstrap.Reader.Token, bootstrap.User.Token)
 
@@ -482,6 +594,39 @@ func TestIssueWriting(t *testing.T) {
 		decodeStructuredContent(t, unknown.StructuredContent, &unknownResponse)
 		require.NotNil(t, unknownResponse.Error)
 		assert.Equal(t, "INVALID_ARGUMENT", unknownResponse.Error.Code)
+
+		unknownMilestone := callE2ETool(t, session, "update_issue", map[string]any{
+			"owner":     bootstrap.User.Username,
+			"repo":      bootstrap.Repository,
+			"number":    created.Data.Number,
+			"milestone": "ghost-milestone",
+		})
+		var unknownMilestoneIssue issueResponse
+		decodeStructuredContent(t, unknownMilestone.StructuredContent, &unknownMilestoneIssue)
+		require.NotNil(t, unknownMilestoneIssue.Error)
+		assert.Equal(t, "INVALID_ARGUMENT", unknownMilestoneIssue.Error.Code)
+
+		t.Log("Clearing the milestone as the repository owner.")
+		cleared := callE2ETool(t, session, "update_issue", map[string]any{
+			"owner":     bootstrap.User.Username,
+			"repo":      bootstrap.Repository,
+			"number":    created.Data.Number,
+			"milestone": "",
+		})
+		var clearedIssue issueResponse
+		decodeStructuredContent(t, cleared.StructuredContent, &clearedIssue)
+		require.NotNil(t, clearedIssue.Data)
+		assert.Nil(t, clearedIssue.Data.Milestone)
+
+		refetched := callIssue(t, session, map[string]any{
+			"owner":  bootstrap.User.Username,
+			"repo":   bootstrap.Repository,
+			"number": created.Data.Number,
+		})
+		require.NotNil(t, refetched.Data)
+		assert.Nil(t, refetched.Data.Milestone, "the milestone must stay cleared in Gogs")
+		require.NotNil(t, refetched.Data.Assignee)
+		assert.Equal(t, bootstrap.User.Username, refetched.Data.Assignee.Username)
 	})
 	assertNoSecrets(t, ownerLogs, bootstrap.User.Token)
 

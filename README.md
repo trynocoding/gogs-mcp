@@ -19,6 +19,8 @@ Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tool
 | `get_issue` | Return one issue with body, creator, assignee, labels, milestone, comment count, and timestamps. |
 | `list_issue_comments` | List the comments of one issue in creation order, optionally restricted to comments since an RFC3339 timestamp. |
 | `create_issue` | Create an issue with a title and an optional body. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
+| `update_issue` | Update the title, body, state, assignee, or milestone of one issue. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
+| `create_issue_comment` | Add a comment to one issue. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
 
 ## Requirements
 
@@ -66,7 +68,9 @@ The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE
 
 Gogs issues track repository-internal discussion; Jira remains the requirements system of record, and this server does not sync with Jira. `list_issues` accepts only the `open` and `closed` states because Gogs v0.14.2 treats every other value as open, and it does not accept a page size because Gogs v0.14.2 fixes it server-side. The next page comes from the Gogs `Link` header and is reported as `meta.next_page` only when one exists. `list_issues` returns compact summaries without bodies; `get_issue` returns the full record with body, creator, assignee, labels, milestone, comment count, and timestamps, and reports the shared not-found code without revealing whether the repository or the issue exists. `list_issue_comments` validates the RFC3339 `since` timestamp before contacting Gogs, and bounds the result with `max_comments` (default 100, at most 500) and the 64 KiB structured-output limit; reaching either bound sets `meta.truncated` with a warning.
 
-`create_issue` is only registered when `GOGS_MCP_WRITE_ENABLED` is set, so the default server advertises exactly the read-only tool list. It never retries its POST: when the response is lost after the write reached Gogs, the tool reports `WRITE_OUTCOME_UNKNOWN` and the issue must be looked up instead of recreated. A plain issue needs only a title (1 through 255 characters) and an optional body of at most 1 MiB, and every user with issue-read access can create one. An assignee, labels, or a milestone requires repository push permission (`PERMISSION_DENIED` otherwise), because Gogs silently drops those fields for users without write access; the assignee, every label name, and the milestone title are verified to exist before the issue is created, and unknown references are rejected with `INVALID_ARGUMENT`. The result carries the issue number, its state, and its web URL, which `get_issue` can return.
+`create_issue`, `update_issue`, and `create_issue_comment` are only registered when `GOGS_MCP_WRITE_ENABLED` is set, so the default server advertises exactly the read-only tool list. None of them retries its write: when the response is lost after the write reached Gogs, the tool reports `WRITE_OUTCOME_UNKNOWN` and the issue or comment must be looked up instead of repeated. A plain issue needs only a title (1 through 255 characters) and an optional body of at most 1 MiB, and every user with issue-read access can create one. An assignee, labels, or a milestone requires repository push permission (`PERMISSION_DENIED` otherwise), because Gogs silently drops those fields for users without write access; the assignee, every label name, and the milestone title are verified to exist before the issue is created, and unknown references are rejected with `INVALID_ARGUMENT`. The result carries the issue number, its state, and its web URL, which `get_issue` can return.
+
+`update_issue` requires at least one of title, body, assignee, milestone, or state and rejects an empty update before contacting Gogs. Omitted fields keep their current value, while an explicit value replaces it, so an empty body clears the body and an empty assignee or milestone clears the reference. Gogs lets the issue author change the title, body, and state of their own issue and rejects every other update from a user without write access with `PERMISSION_DENIED`; changing the assignee or milestone additionally requires repository push permission and an existing reference, which are verified before the update is sent. Comment bodies must be between 1 byte and 1 MiB, and the comment result carries its ID, author, body, and timestamps.
 
 ## Configure credentials
 
@@ -128,7 +132,7 @@ Environment variables override file values.
 | `GOGS_MCP_CACHE_TTL` | `24h`. | How long a snapshot may stay untouched before it expires. |
 | `GOGS_MCP_SEARCH_TIMEOUT` | `30s`. | Default search time limit for `search_code`, at most `5m`. |
 | `GOGS_MCP_MAX_FILE_BYTES` | `1048576`. | Files larger than this are skipped by `search_code`. |
-| `GOGS_MCP_WRITE_ENABLED` | `false`. | Register `create_issue`. |
+| `GOGS_MCP_WRITE_ENABLED` | `false`. | Register `create_issue`, `update_issue`, and `create_issue_comment`. |
 | `GOGS_HTTP_TIMEOUT` | `30s`. | HTTP request timeout. |
 | `GOGS_LOG_LEVEL` | `info`. | `debug`, `info`, `warn`, or `error`. |
 

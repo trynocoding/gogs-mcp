@@ -201,6 +201,58 @@ func (c *Client) CreateIssue(ctx context.Context, owner, repo string, options Cr
 	return c.withWebURL(owner, repo, mapIssue(response)), nil
 }
 
+// UpdateIssueOptions are the fields of an issue to change, modeled after the
+// Gogs v0.14.2 edit endpoint: a field that is left nil is not sent and the
+// server keeps the current value, while an explicit value replaces it. An
+// empty assignee clears the assignee, milestone ID zero clears the milestone.
+// Gogs silently ignores assignee and milestone changes from users without
+// repository write access.
+type UpdateIssueOptions struct {
+	Title     string
+	Body      *string
+	Assignee  *string
+	Milestone *int64
+	State     *string
+}
+
+// UpdateIssue changes an issue with exactly one PATCH request and returns the
+// updated issue. A write is never retried automatically: whenever the request
+// may have reached Gogs without a usable response, the outcome is reported as
+// WRITE_OUTCOME_UNKNOWN so the caller can fetch the issue before repeating it.
+func (c *Client) UpdateIssue(ctx context.Context, owner, repo string, number int64, options UpdateIssueOptions) (Issue, error) {
+	payload := struct {
+		Title     string  `json:"title,omitempty"`
+		Body      *string `json:"body,omitempty"`
+		Assignee  *string `json:"assignee,omitempty"`
+		Milestone *int64  `json:"milestone,omitempty"`
+		State     *string `json:"state,omitempty"`
+	}{
+		Title:     options.Title,
+		Body:      options.Body,
+		Assignee:  options.Assignee,
+		Milestone: options.Milestone,
+		State:     options.State,
+	}
+	var response issueResponse
+	if err := c.patchJSON(ctx, &response, payload, "repos", owner, repo, "issues", strconv.FormatInt(number, 10)); err != nil {
+		return Issue{}, err
+	}
+	return c.withWebURL(owner, repo, mapIssue(response)), nil
+}
+
+// CreateIssueComment adds one comment to an issue with exactly one POST
+// request under the same no-retry write semantics as CreateIssue.
+func (c *Client) CreateIssueComment(ctx context.Context, owner, repo string, number int64, body string) (IssueComment, error) {
+	payload := struct {
+		Body string `json:"body"`
+	}{Body: body}
+	var response issueCommentResponse
+	if err := c.postJSON(ctx, &response, payload, "repos", owner, repo, "issues", strconv.FormatInt(number, 10), "comments"); err != nil {
+		return IssueComment{}, err
+	}
+	return mapIssueComment(response), nil
+}
+
 // ListRepositoryLabels returns every label defined in the repository, closed
 // or not, so callers can resolve label names to IDs before creating issues.
 func (c *Client) ListRepositoryLabels(ctx context.Context, owner, repo string) ([]RepositoryLabel, error) {

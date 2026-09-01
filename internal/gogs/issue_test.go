@@ -408,3 +408,158 @@ func TestUserExistsUsesRepositoryListing(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, exists)
 }
+
+func TestUpdateIssueSendsExplicitFieldsAndMapsResponse(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		assert.Equal(t, http.MethodPatch, request.Method)
+		assert.Equal(t, "/api/v1/repos/alice/project/issues/7", request.URL.Path)
+		var payload map[string]any
+		assert.NoError(t, json.NewDecoder(request.Body).Decode(&payload))
+		assert.Equal(t, "Renamed issue", payload["title"])
+		assert.Equal(t, "Rewritten body.", payload["body"])
+		assert.Equal(t, "closed", payload["state"])
+		assert.NotContains(t, payload, "assignee")
+		assert.NotContains(t, payload, "milestone")
+		writeResponse(t, writer, `{
+			"number": 7,
+			"title": "Renamed issue",
+			"body": "Rewritten body.",
+			"state": "closed",
+			"user": {"id": 3, "username": "alice"},
+			"comments": 0,
+			"created_at": "2026-01-02T15:04:05Z",
+			"updated_at": "2026-01-03T10:00:00Z"
+		}`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/api/v1/", "secret-token", "", time.Second)
+	body := "Rewritten body."
+	state := "closed"
+	issue, err := client.UpdateIssue(context.Background(), "alice", "project", 7, UpdateIssueOptions{
+		Title: "Renamed issue",
+		Body:  &body,
+		State: &state,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests)
+	assert.Equal(t, int64(7), issue.Number)
+	assert.Equal(t, "Renamed issue", issue.Title)
+	assert.Equal(t, "Rewritten body.", issue.Body)
+	assert.Equal(t, "closed", issue.State)
+	assert.Equal(t, "alice", issue.User.Username)
+	assert.Nil(t, issue.Assignee)
+	assert.Nil(t, issue.Milestone)
+	assert.Empty(t, issue.Labels)
+	assert.Equal(t, "2026-01-02T15:04:05Z", issue.CreatedAt)
+	assert.Equal(t, "2026-01-03T10:00:00Z", issue.UpdatedAt)
+	assert.Equal(t, server.URL+"/alice/project/issues/7", issue.WebURL)
+}
+
+func TestUpdateIssueSendsClearValuesForPointedFields(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		var payload map[string]any
+		assert.NoError(t, json.NewDecoder(request.Body).Decode(&payload))
+		assert.Empty(t, payload["body"])
+		assert.Empty(t, payload["assignee"])
+		assert.EqualValues(t, 0, payload["milestone"])
+		assert.NotContains(t, payload, "title")
+		assert.NotContains(t, payload, "state")
+		writeResponse(t, writer, `{"number": 7, "state": "open"}`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/api/v1/", "secret-token", "", time.Second)
+	cleared := ""
+	milestone := int64(0)
+	_, err := client.UpdateIssue(context.Background(), "alice", "project", 7, UpdateIssueOptions{
+		Body:      &cleared,
+		Assignee:  &cleared,
+		Milestone: &milestone,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests)
+}
+
+func TestUpdateIssueDoesNotRetryWhenOutcomeIsUnknown(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeResponse(t, writer, `not-json`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/api/v1/", "secret-token", "", time.Second)
+	_, err := client.UpdateIssue(context.Background(), "alice", "project", 7, UpdateIssueOptions{Title: "Renamed issue"})
+	require.Error(t, err)
+	assert.Equal(t, int32(1), requests.Load(), "a write must never be retried")
+	assert.Equal(t, CodeWriteOutcomeUnknown, AsError(err).Code)
+}
+
+func TestUpdateIssueClassifiesDefinitiveRejectionWithoutRetrying(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests++
+		http.Error(writer, "forbidden", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/api/v1/", "secret-token", "", time.Second)
+	_, err := client.UpdateIssue(context.Background(), "alice", "project", 7, UpdateIssueOptions{Title: "Renamed issue"})
+	require.Error(t, err)
+	assert.Equal(t, 1, requests)
+	classified := AsError(err)
+	assert.Equal(t, CodePermissionDenied, classified.Code)
+	assert.Equal(t, http.StatusForbidden, classified.HTTPStatus)
+}
+
+func TestCreateIssueCommentSendsBodyAndMapsResponse(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		assert.Equal(t, http.MethodPost, request.Method)
+		assert.Equal(t, "/api/v1/repos/alice/project/issues/7/comments", request.URL.Path)
+		var payload map[string]any
+		assert.NoError(t, json.NewDecoder(request.Body).Decode(&payload))
+		assert.Equal(t, "Confirmed on my machine.", payload["body"])
+		writeResponse(t, writer, `{
+			"id": 11,
+			"user": {"id": 4, "username": "reader"},
+			"body": "Confirmed on my machine.",
+			"created_at": "2026-01-04T09:00:00Z",
+			"updated_at": "2026-01-04T09:00:00Z"
+		}`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/api/v1/", "secret-token", "", time.Second)
+	comment, err := client.CreateIssueComment(context.Background(), "alice", "project", 7, "Confirmed on my machine.")
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests)
+	assert.Equal(t, IssueComment{
+		ID:        11,
+		User:      User{ID: 4, Username: "reader"},
+		Body:      "Confirmed on my machine.",
+		CreatedAt: "2026-01-04T09:00:00Z",
+		UpdatedAt: "2026-01-04T09:00:00Z",
+	}, comment)
+}
+
+func TestCreateIssueCommentDoesNotRetryWhenOutcomeIsUnknown(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.Error(writer, "boom", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/api/v1/", "secret-token", "", time.Second)
+	_, err := client.CreateIssueComment(context.Background(), "alice", "project", 7, "Confirmed on my machine.")
+	require.Error(t, err)
+	assert.Equal(t, int32(1), requests.Load(), "a write must never be retried")
+	assert.Equal(t, CodeWriteOutcomeUnknown, AsError(err).Code)
+}

@@ -423,6 +423,8 @@ func TestServeOverStdioRegistersWriteToolsWhenEnabled(t *testing.T) {
 		"get_issue",
 		"list_issue_comments",
 		"create_issue",
+		"update_issue",
+		"create_issue_comment",
 	}, names)
 	create := make([]*mcp.Tool, 0, 1)
 	for _, tool := range tools.Tools {

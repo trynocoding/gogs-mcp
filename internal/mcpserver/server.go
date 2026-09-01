@@ -35,6 +35,8 @@ type Client interface {
 	ListRepositoryMilestones(context.Context, string, string) ([]gogs.RepositoryMilestone, error)
 	UserExists(context.Context, string) (bool, error)
 	CreateIssue(context.Context, string, string, gogs.CreateIssueOptions) (gogs.Issue, error)
+	UpdateIssue(context.Context, string, string, int64, gogs.UpdateIssueOptions) (gogs.Issue, error)
+	CreateIssueComment(context.Context, string, string, int64, string) (gogs.IssueComment, error)
 }
 
 type Server struct {
