@@ -206,3 +206,46 @@ func writeVendored(t *testing.T, vendor, module string, files map[string]string)
 		require.NoError(t, os.WriteFile(filepath.Join(directory, name), []byte(contents), 0o644))
 	}
 }
+
+func TestSourceMetadataOmitsAndEncodesTestAssets(t *testing.T) {
+	without, err := BuildSourceMetadata(SourceMetadata{
+		Product: "gogs-mcp",
+		Version: "1.2.3",
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, string(without), "test_assets",
+		"a bundle without a test asset must not mention test_assets")
+
+	with, err := BuildSourceMetadata(SourceMetadata{
+		Product: "gogs-mcp",
+		Version: "1.2.3",
+		TestAssets: &TestAsset{
+			Reference:    "gogs-e2e:" + GogsE2EVersion,
+			GogsVersion:  GogsE2EVersion,
+			GogsCommit:   GogsE2ECommit,
+			Architecture: "linux/amd64",
+			Archive:      Artifact{Path: "test-assets/gogs-0.14.2-amd64-image.tar", SHA256: "abc"},
+		},
+	})
+	require.NoError(t, err)
+	var parsed struct {
+		TestAssets *struct {
+			Reference    string `json:"reference"`
+			GogsVersion  string `json:"gogs_version"`
+			GogsCommit   string `json:"gogs_commit"`
+			Architecture string `json:"architecture"`
+			Archive      struct {
+				Path   string `json:"path"`
+				SHA256 string `json:"sha256"`
+			} `json:"archive"`
+		} `json:"test_assets"`
+	}
+	require.NoError(t, json.Unmarshal(with, &parsed))
+	require.NotNil(t, parsed.TestAssets)
+	assert.Equal(t, "gogs-e2e:0.14.2", parsed.TestAssets.Reference)
+	assert.Equal(t, "0.14.2", parsed.TestAssets.GogsVersion)
+	assert.Equal(t, GogsE2ECommit, parsed.TestAssets.GogsCommit)
+	assert.Equal(t, "linux/amd64", parsed.TestAssets.Architecture)
+	assert.Equal(t, "test-assets/gogs-0.14.2-amd64-image.tar", parsed.TestAssets.Archive.Path)
+	assert.Equal(t, "abc", parsed.TestAssets.Archive.SHA256)
+}

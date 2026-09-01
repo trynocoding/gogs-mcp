@@ -131,6 +131,16 @@ func TestSearch(t *testing.T) {
 		require.NotNil(t, unknownResponse.Error)
 		assert.Equal(t, "RESOURCE_NOT_FOUND_OR_FORBIDDEN", unknownResponse.Error.Code)
 
+		// An invalid regular expression is rejected before any Gogs request.
+		invalidRegex := callE2ETool(t, session, "search_code", map[string]any{
+			"owner": "owner", "repo": bootstrap.SharedRepository, "query": "feature-version(", "mode": "regex",
+		})
+		assert.True(t, invalidRegex.IsError)
+		var invalidRegexResponse searchResponse
+		decodeStructuredContent(t, invalidRegex.StructuredContent, &invalidRegexResponse)
+		require.NotNil(t, invalidRegexResponse.Error)
+		assert.Equal(t, "INVALID_ARGUMENT", invalidRegexResponse.Error.Code)
+
 		// A repeat search within the same process hits the published snapshot.
 		repeat := callSearch(t, session, map[string]any{
 			"owner": "owner", "repo": bootstrap.SharedRepository, "query": "feature-version", "ref": bootstrap.Refs.FeatureBranch,

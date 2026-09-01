@@ -13,6 +13,9 @@ public internet.
 - `images/gogs-mcp-<version>-linux-amd64-oci.tar` is the OCI image of the
   server; see `container.md` for importing and running it with Podman or
   Docker.
+- `test-assets/gogs-0.14.2-amd64-image.tar` holds the pinned Gogs v0.14.2
+  E2E image for offline test replays; bundles assembled without a container
+  engine or the pinned Gogs checkout ship without it.
 - `scripts/` contains the install, uninstall, offline verification, and
   image loading scripts.
 - `docs/` contains the product documentation.
@@ -31,7 +34,8 @@ from the Fedora base installation. Rebuilding the bundled source needs a Go
 
 After extracting the archive, run the offline verification. It checks the
 manifest checksums, the binary architecture and static linking, the version
-identity of the binary and the source archive, and the stdio MCP protocol.
+identity of the binary and the source archive, the digest of the bundled
+Gogs E2E image when one is present, and the stdio MCP protocol.
 None of these steps access the network.
 
 ```bash

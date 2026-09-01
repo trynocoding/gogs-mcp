@@ -12,6 +12,10 @@ vars:
     sh: date -u +%Y-%m-%dT%H:%M:%SZ | tr -d '\n'
   PACKAGE_DIR: dist/gogs-mcp-{{.PACKAGE_VERSION}}-fedora43-amd64-offline
   PACKAGE_STAGING: dist/.source-staging
+  # Must mirror the GogsE2E constants in internal/packagegen: the Taskfile
+  # builds the pinned Gogs test image that mkpackage then records.
+  GOGS_E2E_VERSION: '0.14.2'
+  GOGS_E2E_COMMIT: '5dcb6c64bdf61e38dbdbb941c1d69789c560d0fb'
 
 tasks:
   default:
@@ -44,6 +48,26 @@ tasks:
       - cp package/scripts/install.sh package/scripts/uninstall.sh package/scripts/verify-offline.sh package/scripts/load-image.sh {{.PACKAGE_DIR}}/scripts/
       - cp package/docs/*.md {{.PACKAGE_DIR}}/docs/
       - cp config.example.json package/config/mcp.example.json package/config/docker-mcp.example.json package/config/podman-mcp.example.json {{.PACKAGE_DIR}}/config/
+      - |
+        # Build the pinned Gogs v0.14.2 E2E image for offline test replays
+        # when docker and the pinned Gogs checkout are available.
+        source_dir="${GOGS_E2E_SOURCE_DIR:-../gogs}"
+        # A docker binary without a reachable daemon must degrade to the skip
+        # branch too: packaging worked without docker before the test assets.
+        if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && [ "$(git -C "$source_dir" rev-parse HEAD 2>/dev/null)" = "{{.GOGS_E2E_COMMIT}}" ]; then
+          mkdir -p {{.PACKAGE_DIR}}/test-assets {{.PACKAGE_STAGING}}/gogs-src
+          git -C "$source_dir" archive --format=tar {{.GOGS_E2E_COMMIT}} | tar -x -C {{.PACKAGE_STAGING}}/gogs-src
+          cp tests/e2e/testdata/gogs.Dockerfile {{.PACKAGE_STAGING}}/gogs-src/Dockerfile.smoke
+          for pair in bootstrap:e2ebootstrap repositories-bootstrap:e2erepositories issues-bootstrap:e2eissues; do
+            mkdir -p {{.PACKAGE_STAGING}}/gogs-src/internal/${pair#*:}
+            cp tests/e2e/testdata/${pair%%:*}/main.go {{.PACKAGE_STAGING}}/gogs-src/internal/${pair#*:}/main.go
+          done
+          docker build --platform linux/amd64 --build-arg GOGS_COMMIT={{.GOGS_E2E_COMMIT}} --tag gogs-e2e:{{.GOGS_E2E_VERSION}} -f {{.PACKAGE_STAGING}}/gogs-src/Dockerfile.smoke {{.PACKAGE_STAGING}}/gogs-src
+          docker save --platform linux/amd64 -o {{.PACKAGE_DIR}}/test-assets/gogs-{{.GOGS_E2E_VERSION}}-amd64-image.tar gogs-e2e:{{.GOGS_E2E_VERSION}}
+          rm -rf {{.PACKAGE_STAGING}}/gogs-src
+        else
+          echo "Skipping the Gogs E2E test image: docker or the pinned Gogs checkout is unavailable."
+        fi
       - |
         # The metadata and the OCI image are assembled with every network
         # interface removed; the fallback keeps environments without user
@@ -136,6 +160,23 @@ tasks:
     deps: [build]
     cmds:
       - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestIssue'
+
+  test:e2e:protocol:
+    desc: Run the legacy MCP initialize compatibility test.
+    deps: [build]
+    cmds:
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestLegacyInitializeProtocol$'
+
+  test:e2e:
+    desc: Run every E2E scenario against isolated Gogs v0.14.2; the offline package test runs through verify:offline.
+    cmds:
+      - task: test:e2e:smoke
+      - task: test:e2e:repositories
+      - task: test:e2e:contents
+      - task: test:e2e:git
+      - task: test:e2e:search
+      - task: test:e2e:issues
+      - task: test:e2e:protocol
 
   lint:
     desc: Run all configured linters.

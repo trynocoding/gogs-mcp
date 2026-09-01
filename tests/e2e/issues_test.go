@@ -556,7 +556,10 @@ func TestIssueWriting(t *testing.T) {
 		require.NotNil(t, foreignIssue.Error)
 		assert.Equal(t, "PERMISSION_DENIED", foreignIssue.Error.Code)
 	})
-	assertNoSecrets(t, readerWriteLogs, bootstrap.Reader.Token, bootstrap.User.Token)
+	// The created issue body is the private content of this scenario; it must
+	// never surface in any log of the MCP server process.
+	assertNoSecrets(t, readerWriteLogs, bootstrap.Reader.Token, bootstrap.User.Token,
+		"Steps to reproduce the crash.", "The crash reproduces on empty input.")
 
 	t.Log("Verifying create_issue with administrative fields as the owner.")
 	ownerLogs := useMCPClientWithOptions(t, projectRoot, baseURL, bootstrap.User.Token, "", writeEnv, e2eWritingToolNames, func(session *mcp.ClientSession) {

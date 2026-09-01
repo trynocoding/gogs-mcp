@@ -233,17 +233,18 @@ func randomUUID() (string, error) {
 // package so verification can tie the binary, the source archive, and the
 // build metadata together.
 type SourceMetadata struct {
-	Product   string         `json:"product"`
-	Version   string         `json:"version"`
-	Commit    string         `json:"commit"`
-	BuildTime string         `json:"build_time"`
-	GoVersion string         `json:"go_version"`
-	Target    Target         `json:"target"`
-	GogsAPI   string         `json:"gogs_api_target"`
-	Binary    Artifact       `json:"binary"`
-	Source    Artifact       `json:"source_archive"`
-	Image     ContainerImage `json:"container_image"`
-	Static    bool           `json:"statically_linked"`
+	Product    string         `json:"product"`
+	Version    string         `json:"version"`
+	Commit     string         `json:"commit"`
+	BuildTime  string         `json:"build_time"`
+	GoVersion  string         `json:"go_version"`
+	Target     Target         `json:"target"`
+	GogsAPI    string         `json:"gogs_api_target"`
+	Binary     Artifact       `json:"binary"`
+	Source     Artifact       `json:"source_archive"`
+	Image      ContainerImage `json:"container_image"`
+	TestAssets *TestAsset     `json:"test_assets,omitempty"`
+	Static     bool           `json:"statically_linked"`
 }
 
 // ContainerImage records the reference of the bundled OCI image and the
@@ -251,6 +252,22 @@ type SourceMetadata struct {
 type ContainerImage struct {
 	Reference string   `json:"reference"`
 	Archive   Artifact `json:"archive"`
+}
+
+// GogsE2EVersion and GogsE2ECommit pin the Gogs test image that ships in the
+// test-assets directory of a bundle for offline E2E replays.
+const (
+	GogsE2EVersion = "0.14.2"
+	GogsE2ECommit  = "5dcb6c64bdf61e38dbdbb941c1d69789c560d0fb"
+)
+
+// TestAsset records the identity of the bundled Gogs E2E image.
+type TestAsset struct {
+	Reference    string   `json:"reference"`
+	GogsVersion  string   `json:"gogs_version"`
+	GogsCommit   string   `json:"gogs_commit"`
+	Architecture string   `json:"architecture"`
+	Archive      Artifact `json:"archive"`
 }
 
 // Target is the operating system and architecture the binary was built for.

@@ -71,6 +71,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	testAsset, err := findTestAsset(*root)
+	if err != nil {
+		return err
+	}
 
 	sbom, err := packagegen.BuildSBOM("gogs-mcp", *productVersion, *commit, image.Reference, modules)
 	if err != nil {
@@ -103,7 +107,8 @@ func run() error {
 				SHA256: imageDigest,
 			},
 		},
-		Static: info.Static,
+		TestAssets: testAsset,
+		Static:     info.Static,
 	})
 	if err != nil {
 		return err
@@ -124,4 +129,33 @@ func readModules(project string) ([]packagegen.Module, error) {
 		return nil, fmt.Errorf("vendor/modules.txt lists no modules")
 	}
 	return modules, nil
+}
+
+// findTestAsset reads the optional Gogs E2E image the Taskfile placed under
+// test-assets; a missing directory means the bundle ships without it.
+func findTestAsset(root string) (*packagegen.TestAsset, error) {
+	matches, err := filepath.Glob(filepath.Join(root, "test-assets", "gogs-*.tar"))
+	if err != nil {
+		return nil, fmt.Errorf("list test-assets: %w", err)
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("expected at most one test asset under %s/test-assets", root)
+	}
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	digest, err := packagegen.FileSHA256(matches[0])
+	if err != nil {
+		return nil, err
+	}
+	return &packagegen.TestAsset{
+		Reference:    "gogs-e2e:" + packagegen.GogsE2EVersion,
+		GogsVersion:  packagegen.GogsE2EVersion,
+		GogsCommit:   packagegen.GogsE2ECommit,
+		Architecture: "linux/amd64",
+		Archive: packagegen.Artifact{
+			Path:   "test-assets/" + filepath.Base(matches[0]),
+			SHA256: digest,
+		},
+	}, nil
 }

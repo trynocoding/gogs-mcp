@@ -83,6 +83,25 @@ if [ "$actual_digest" != "$source_digest" ]; then
 	exit 1
 fi
 
+# The Gogs E2E image is optional: bundles assembled without docker or the
+# pinned Gogs checkout ship without a test-assets directory.
+if grep -q '"test_assets"' "$metadata"; then
+	echo "Checking the bundled Gogs E2E image."
+	test_block=$(sed -n '/"test_assets"/,/}/p' "$metadata")
+	test_file=$(printf '%s\n' "$test_block" | sed -n 's/.*"path": "\([^"]*\)".*/\1/p')
+	test_digest=$(printf '%s\n' "$test_block" | sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p')
+	if [ -z "$test_file" ] || [ ! -f "$test_file" ]; then
+		echo "verify-offline.sh: SOURCE-METADATA.json points at the missing test asset $test_file." >&2
+		exit 1
+	fi
+	actual_test_digest=$(sha256sum "$test_file")
+	actual_test_digest=${actual_test_digest%% *}
+	if [ "$actual_test_digest" != "$test_digest" ]; then
+		echo "verify-offline.sh: the Gogs E2E image digest does not match SOURCE-METADATA.json." >&2
+		exit 1
+	fi
+fi
+
 echo "Exercising the stdio MCP protocol with a placeholder configuration."
 initialize='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"verify-offline","version":"0"}}}'
 initialized='{"jsonrpc":"2.0","method":"notifications/initialized"}'

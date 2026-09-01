@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -208,7 +209,10 @@ func TestContents(t *testing.T) {
 		}
 	})
 
-	assertNoSecrets(t, mcpLogs, secrets...)
+	// The Unicode fixture lives inside the private repository, so its content
+	// must never surface in any log of the MCP server process.
+	leakNeedles := slices.Concat(secrets, []string{"你好，Gogs"})
+	assertNoSecrets(t, mcpLogs, leakNeedles...)
 	gogsLogs, err := runCommand(commandContext, "read Gogs content E2E logs", "docker", "logs", environment.container)
 	require.NoError(t, err)
 	assertNoSecrets(t, gogsLogs, secrets...)

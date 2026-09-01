@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -108,7 +110,14 @@ func TestOfflinePackage(t *testing.T) {
 	uninstall := filepath.Join(packageDir, "scripts", "uninstall.sh")
 
 	var metadata struct {
-		Version string `json:"version"`
+		Version    string `json:"version"`
+		TestAssets *struct {
+			Reference string `json:"reference"`
+			Archive   struct {
+				Path   string `json:"path"`
+				SHA256 string `json:"sha256"`
+			} `json:"archive"`
+		} `json:"test_assets"`
 	}
 	metadataBytes, err := os.ReadFile(filepath.Join(packageDir, "SOURCE-METADATA.json"))
 	require.NoError(t, err)
@@ -167,6 +176,32 @@ func TestOfflinePackage(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []string{".dockerenv", "cache/", "gogs-mcp"}, fileSystemEntries,
 		"the image must contain only the binary and the cache directory")
+
+	if metadata.TestAssets != nil {
+		t.Log("Importing the bundled Gogs E2E image and checking its identity.")
+		testAssetPath := filepath.Join(packageDir, filepath.FromSlash(metadata.TestAssets.Archive.Path))
+		require.FileExists(t, testAssetPath)
+		testAssetDigest, err := fileSHA256(testAssetPath)
+		require.NoError(t, err)
+		assert.Equal(t, metadata.TestAssets.Archive.SHA256, testAssetDigest)
+
+		loadContext, cancelLoad := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancelLoad()
+		_, err = runCommand(loadContext, "load the Gogs E2E image", "docker", "load", "--input", testAssetPath)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			removeContext, cancelRemove := context.WithTimeout(context.Background(), time.Minute)
+			defer cancelRemove()
+			_, _ = runCommand(removeContext, "remove the Gogs E2E image", "docker", "image", "rm", "--force", metadata.TestAssets.Reference)
+		})
+		inspectContext, cancelInspect := context.WithTimeout(context.Background(), time.Minute)
+		defer cancelInspect()
+		inspected, err := runCommand(inspectContext, "inspect the Gogs E2E image", "docker", "image", "inspect",
+			"--format", "{{.Os}} {{.Architecture}}", metadata.TestAssets.Reference)
+		require.NoError(t, err)
+		assert.Equal(t, "linux amd64", strings.TrimSpace(string(inspected)),
+			"the bundled Gogs E2E image must be a linux/amd64 image")
+	}
 
 	t.Log("Checking that the installed files and the product manifest agree.")
 	installedList, err := os.ReadFile(filepath.Join(prefix, "share", "gogs-mcp", "installed-files.list"))
@@ -256,6 +291,20 @@ func TestOfflinePackage(t *testing.T) {
 	require.NoDirExists(t, tokenDir)
 	require.NoDirExists(t, filepath.Join(home, ".cache", "gogs-mcp"))
 	require.FileExists(t, unrelated, "--purge still never deletes files outside the product manifest")
+}
+
+// fileSHA256 returns the hex digest of a file on disk.
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 // runTask runs a Taskfile target from the project root.

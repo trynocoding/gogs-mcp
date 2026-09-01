@@ -46,9 +46,9 @@ task package
 task verify:offline
 ```
 
-`task package` assembles `dist/gogs-mcp-<version>-fedora43-amd64-offline.tar.gz`: a statically linked Linux AMD64 binary, the full source archive with vendored dependencies, an OCI container image of the server, the install, uninstall, image loading, and offline verification scripts, the product documentation, a SHA-256 manifest, a CycloneDX SBOM, third-party licenses, and `SOURCE-METADATA.json`. The binary embeds the version, commit, and build time, and `gogs-mcp version --json` prints them machine-readably.
+`task package` assembles `dist/gogs-mcp-<version>-fedora43-amd64-offline.tar.gz`: a statically linked Linux AMD64 binary, the full source archive with vendored dependencies, an OCI container image of the server, the pinned Gogs v0.14.2 E2E image (when docker and the pinned Gogs checkout are available), the install, uninstall, image loading, and offline verification scripts, the product documentation, a SHA-256 manifest, a CycloneDX SBOM, third-party licenses, and `SOURCE-METADATA.json`. The binary embeds the version, commit, and build time, and `gogs-mcp version --json` prints them machine-readably.
 
-`task verify:offline` unpacks the bundle and proves it works without network access: it checks the manifest checksums, the binary architecture and static linking, the version identity of the binary and the source archive, the stdio MCP protocol with a placeholder configuration, a rebuild of the vendored source with `GOTOOLCHAIN=local GOPROXY=off`, an install and uninstall round trip inside a network-less namespace, and — when a container engine is present — an import of the OCI image whose architecture, container user, and product identity it verifies with pulls disabled.
+`task verify:offline` unpacks the bundle and proves it works without network access: it checks the manifest checksums, the binary architecture and static linking, the version identity of the binary and the source archive, the digest of the bundled Gogs E2E image when one is present, the stdio MCP protocol with a placeholder configuration, a rebuild of the vendored source with `GOTOOLCHAIN=local GOPROXY=off`, an install and uninstall round trip inside a network-less namespace, and — when a container engine is present — an import of the OCI image whose architecture, container user, and product identity it verifies with pulls disabled.
 
 ## Run the real Gogs smoke test
 
@@ -61,7 +61,10 @@ task test:e2e:contents
 task test:e2e:git
 task test:e2e:search
 task test:e2e:issues
+task test:e2e:protocol
 ```
+
+`task test:e2e` runs every scenario in one command: repository discovery, source browsing, code search, issue creation and maintenance, the legacy MCP initialize handshake, and the authentication and permission failure paths. A log scan after each session proves that no token, private source, or issue body leaks.
 
 Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The repository E2E scenario creates an owner, a read-only collaborator, an outsider, and isolated private repositories to verify actual Gogs visibility and permission behavior. Every run uses a random host port, container network, image name, and temporary data directory. The tests remove all of them after success or failure.
 
