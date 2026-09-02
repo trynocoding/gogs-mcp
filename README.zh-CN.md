@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-Gogs MCP 是一个本地 stdio MCP 服务器，对接 Gogs v0.14.2。默认只提供只读工具：查看当前登录用户，浏览该用户有权访问的所有仓库。
+Gogs MCP 是一个本地 stdio MCP 服务器，对接 Gogs v0.14.2。默认只读：查看当前登录用户、浏览有权访问的仓库及其内容、读取 issue、审查 pull request。写 issue 的工具要显式设置 `GOGS_MCP_WRITE_ENABLED` 才注册。
 
 | 工具 | 用途 |
 |---|---|
@@ -20,6 +20,9 @@ Gogs MCP 是一个本地 stdio MCP 服务器，对接 Gogs v0.14.2。默认只�
 | `list_issues` | 按 Gogs 返回的顺序列出 open 或 closed 的 issue，包含编号、标题、创建者、标签、评论数和时间戳。 |
 | `get_issue` | 返回一个 issue 的完整记录：正文、创建者、指派人、标签、里程碑、评论数、时间戳。 |
 | `list_issue_comments` | 按创建顺序列出一个 issue 的评论，可以用 RFC3339 时间戳只取某个时刻之后的评论。 |
+| `list_pull_requests` | 列出一个仓库的 pull request：标题、作者、状态、评论数、时间戳和头提交 SHA，数据来自 pull 引用和对应的 issue。 |
+| `get_pull_request` | 返回单个 pull request 的正文、标签、头提交 SHA 和 web URL。目标分支默认取仓库默认分支，由 `base_ref_assumed` 标注。 |
+| `get_pull_request_diff` | 渲染单个 pull request 的 merge-base diff：标准 unified 格式，带逐文件统计、提交列表和字节上限。 |
 | `create_issue` | 创建 issue，标题必填，正文可选。仅在设置了 `GOGS_MCP_WRITE_ENABLED` 时注册。 |
 | `update_issue` | 更新一个 issue 的标题、正文、状态、指派人或里程碑。仅在设置了 `GOGS_MCP_WRITE_ENABLED` 时注册。 |
 | `create_issue_comment` | 为一个 issue 添加评论。仅在设置了 `GOGS_MCP_WRITE_ENABLED` 时注册。 |
@@ -80,9 +83,19 @@ Gogs checkout 不在默认位置时，用 `GOGS_E2E_SOURCE_DIR` 指定路径。�
 
 所有结果边界都可观察：默认最多返回 50 个匹配（`max_results` 可以调到 500），每个匹配带文件路径、从 1 起算的行号和字节列号、匹配行，以及前后各两行上下文（`context_lines`，0 到 10）。命中 `max_results`、64 KiB 输出上限或搜索时限（`timeout_seconds`，1 到 300）任何一个，`meta.truncated` 都会置位并附警告。超时但已有部分结果时照常返回；一无所获的超时返回 `SEARCH_TIMEOUT`。`include` 和 `exclude` 的 glob 过滤路径，`.git` 始终排除。二进制文件（含 NUL 字节或无效 UTF-8）和超过 1 MiB 的文件（上限 `GOGS_MCP_MAX_FILE_BYTES`）会跳过，并在警告里说明。重复搜索同一个 commit 时，结果带 `meta.cache_hit`，不会再请求 Gogs。
 
-快照缓存有上限：24 小时（`GOGS_MCP_CACHE_TTL`）没被用到的快照过期；每个用户的缓存超过 2 GiB（`GOGS_MCP_CACHE_MAX_BYTES`）时，先淘汰最近最少使用的快照，再开始新下载。正在被搜索使用的快照不会被淘汰；实在腾不出空间，这次搜索就以 `CACHE_CAPACITY_EXCEEDED` 失败，而不是继续下载。`gogs-mcp cache clean` 清掉当前用户的快照缓存，`gogs-mcp cache clean --all` 清掉所有已验证的缓存根；配置、令牌和缓存根之外的任何东西都不会动。
+快照缓存有上限：24 小时（`GOGS_MCP_CACHE_TTL`）没被用到的快照过期；每个用户的缓存超过 2 GiB（`GOGS_MCP_CACHE_MAX_BYTES`）时，先淘汰最近最少使用的快照，再开始新下载。正在被搜索使用的快照不会被淘汰；实在腾不出空间，这次搜索就以 `CACHE_CAPACITY_EXCEEDED` 失败，而不是继续下载。`gogs-mcp cache clean` 清掉当前用户的快照缓存和 pull request diff 缓存，`gogs-mcp cache clean --all` 清掉所有已验证的缓存根；配置、令牌和缓存根之外的任何东西都不会动。
 
 Gogs 的 issue 只用于仓库内部讨论；需求仍以 Jira 为准，本服务器不与 Jira 同步。`list_issues` 只接受 `open` 和 `closed` 两个状态值——Gogs v0.14.2 会把其他值一律当成 open；page size 也不让传，服务端写死了。有没有下一页看 Gogs 的 `Link` 响应头，有的话通过 `meta.next_page` 告诉你。`list_issues` 返回紧凑摘要，不带正文；`get_issue` 返回完整记录，含正文、创建者、指派人、标签、里程碑、评论数和时间戳。找不到时统一返回同一个 not-found 错误码，不区分是仓库不存在还是 issue 不存在。`list_issue_comments` 先验证 `since` 是不是合法的 RFC3339 时间戳，再去请求 Gogs；结果受 `max_comments`（默认 100，最多 500）和 64 KiB 输出上限约束，碰到任一上限就置位 `meta.truncated` 并附警告。
+
+Gogs v0.14.2 没有 pull request API。`list_pull_requests`、`get_pull_request` 和 `get_pull_request_diff` 用 Gogs 实际提供的东西拼出 pull request 数据：base 仓库上的 `refs/pull/{number}/head` 引用、底层的 issue，以及 git 协议。三个工具都是只读的，始终注册。
+
+`list_pull_requests` 用 `ls-remote` 列出仓库的全部 pull 引用，新的在前，逐条拼上 issue 元数据。`state` 接受 `open`（默认）、`closed` 和 `all`；`limit` 默认 30，最多 100。每条结果都要查一次 issue，所以结果按 `limit` 截断，没有分页。
+
+`get_pull_request` 补上正文、标签和 web URL，外加头提交 SHA。目标分支在 API 里拿不到，`base_ref` 填的是仓库默认分支，`base_ref_assumed` 为 `true`；pull request 实际指向别的分支时，给 diff 工具显式传 base。
+
+`get_pull_request_diff` 渲染 merge-base diff：引擎把 pull 引用和 base 分支 fetch 到 `GOGS_MCP_CACHE_DIR` 下的裸缓存仓库，算出 merge base，再按标准 unified 格式编码。结果带每个文件的新增/删除行数、merge base 到头提交之间的提交列表和 merge-base SHA。`max_bytes` 限制渲染出的 diff 大小（默认 256 KiB，至多 4 MiB），触顶时 `meta.truncated` 置位并附警告。`base_ref` 可以覆盖假定的目标分支；没有 pull 引用的 issue 返回 `INVALID_ARGUMENT`。git 走 HTTP(S) 时用同一个令牌做 basic auth。
+
+diff 缓存自己没有容量上限和过期时间，`gogs-mcp cache clean` 会把它和快照缓存一起清掉。
 
 `create_issue`、`update_issue` 和 `create_issue_comment` 仅在设置 `GOGS_MCP_WRITE_ENABLED` 时注册，所以默认服务器提供的工具清单是纯只读的。三个工具都不会自动重试：如果写请求已经到达 Gogs 但响应丢了，工具会报 `WRITE_OUTCOME_UNKNOWN`，这时应该去查 issue 或评论确认结果，而不是再写一次。创建普通 issue 只需要标题（1 到 255 字符），正文可选、最大 1 MiB；只要有读 issue 的权限就能建。要设置指派人、标签或里程碑，需要仓库的 push 权限，否则报 `PERMISSION_DENIED`——因为 Gogs 会悄悄丢弃无写权限用户的这些字段。指派人、每个标签名和里程碑标题会先验证存在，引用不存在时返回 `INVALID_ARGUMENT`。结果里有 issue 编号、状态和 web URL，可以用 `get_issue` 再查。
 
@@ -142,7 +155,7 @@ claude mcp add gogs \
 | `GOGS_TOKEN_FILE` | 无。 | 私有令牌文件的路径。 |
 | `GOGS_CA_FILE` | 系统信任库。 | 额外的 PEM CA 证书文件。 |
 | `GOGS_ALLOW_INSECURE_HTTP` | `false`。 | 显式允许纯 HTTP。 |
-| `GOGS_MCP_CACHE_DIR` | OS 用户缓存目录。 | `search_code` 快照缓存根的绝对路径。 |
+| `GOGS_MCP_CACHE_DIR` | OS 用户缓存目录。 | `search_code` 快照与 pull request diff 缓存根的绝对路径。 |
 | `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`。 | 每个用户快照缓存的容量上限，超过后按最近最少使用淘汰。 |
 | `GOGS_MCP_CACHE_TTL` | `24h`。 | 快照多久没被使用就过期。 |
 | `GOGS_MCP_SEARCH_TIMEOUT` | `30s`。 | `search_code` 的默认搜索时限，至多 `5m`。 |

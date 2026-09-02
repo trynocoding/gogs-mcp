@@ -1,6 +1,6 @@
 # Gogs MCP
 
-Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tools for inspecting the authenticated user and discovering every repository available to that user.
+Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tools for inspecting the authenticated user, browsing repositories and their content, reading issues, and reviewing pull requests. Write tools for issues are only registered when `GOGS_MCP_WRITE_ENABLED` is set.
 
 | Tool | Purpose |
 |---|---|
@@ -18,6 +18,9 @@ Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tool
 | `list_issues` | List open or closed issues with number, title, creator, labels, comment count, and timestamps, following the Gogs page order. |
 | `get_issue` | Return one issue with body, creator, assignee, labels, milestone, comment count, and timestamps. |
 | `list_issue_comments` | List the comments of one issue in creation order, optionally restricted to comments since an RFC3339 timestamp. |
+| `list_pull_requests` | List the pull requests of a repository with title, author, state, comment count, timestamps, and head SHA, assembled from the pull refs and their issues. |
+| `get_pull_request` | Return one pull request with body, labels, head SHA, and web URL. The target branch is the repository default branch, flagged by `base_ref_assumed`. |
+| `get_pull_request_diff` | Render the merge-base diff of one pull request as a standard unified diff with per-file stats, the commit list, and a byte limit. |
 | `create_issue` | Create an issue with a title and an optional body. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
 | `update_issue` | Update the title, body, state, assignee, or milestone of one issue. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
 | `create_issue_comment` | Add a comment to one issue. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
@@ -48,7 +51,7 @@ task verify:offline
 
 `task package` assembles `dist/gogs-mcp-<version>-fedora43-amd64-offline.tar.gz`: a statically linked Linux AMD64 binary, the full source archive with vendored dependencies, an OCI container image of the server, the pinned Gogs v0.14.2 E2E image (when docker and the pinned Gogs checkout are available), the install, uninstall, image loading, and offline verification scripts, the product documentation, a SHA-256 manifest, a CycloneDX SBOM, third-party licenses, and `SOURCE-METADATA.json`. The binary embeds the version, commit, and build time, and `gogs-mcp version --json` prints them machine-readably.
 
-`task verify:offline` unpacks the bundle and proves it works without network access: it checks the manifest checksums, the binary architecture and static linking, the version identity of the binary and the source archive, the digest of the bundled Gogs E2E image when one is present, the stdio MCP protocol with a placeholder configuration, a rebuild of the vendored source with `GOTOOLCHAIN=local GOPROXY=off`, an install and uninstall round trip inside a network-less namespace, and — when a container engine is present — an import of the OCI image whose architecture, container user, and product identity it verifies with pulls disabled.
+`task verify:offline` unpacks the bundle and verifies it works without network access: it checks the manifest checksums, the binary architecture and static linking, the version identity of the binary and the source archive, the digest of the bundled Gogs E2E image when one is present, the stdio MCP protocol with a placeholder configuration, a rebuild of the vendored source with `GOTOOLCHAIN=local GOPROXY=off`, an install and uninstall round trip inside a network-less namespace, and — when a container engine is present — an import of the OCI image whose architecture, container user, and product identity it verifies with pulls disabled.
 
 ## Run the real Gogs smoke test
 
@@ -78,9 +81,19 @@ Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The reposi
 
 Results are bounded and every bound is observable. Up to 50 matches are returned (at most 500 via `max_results`) with file path, 1-based line and byte column, the matching line, and two lines of context before and after (`context_lines`, 0 through 10). Reaching `max_results`, the 64 KiB structured-output limit, or the search time limit (`timeout_seconds`, 1 through 300) sets `meta.truncated` with a warning; a timeout with partial results returns them, and a timeout without results returns `SEARCH_TIMEOUT`. The `include` and `exclude` glob patterns restrict or skip paths, and always exclude `.git`. Binary files (a NUL byte or invalid UTF-8) and files larger than 1 MiB (`GOGS_MCP_MAX_FILE_BYTES`) are skipped and reported in warnings. Repeat searches for the same commit set `meta.cache_hit` and do not contact Gogs again.
 
-The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) are expired and the least recently used snapshots are removed when the per-user cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`), before a new download starts. Snapshots held by an active search are never evicted; when no room can be made, the search fails with `CACHE_CAPACITY_EXCEEDED` instead of downloading. `gogs-mcp cache clean` removes the authenticated user's snapshot cache and `gogs-mcp cache clean --all` removes every verified cache root; configuration, tokens, and anything outside the cache root are never touched.
+The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) are expired and the least recently used snapshots are removed when the per-user cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`), before a new download starts. Snapshots held by an active search are never evicted; when no room can be made, the search fails with `CACHE_CAPACITY_EXCEEDED` instead of downloading. `gogs-mcp cache clean` removes the authenticated user's snapshot and pull request caches and `gogs-mcp cache clean --all` removes every verified cache root; configuration, tokens, and anything outside the cache root are never touched.
 
 Gogs issues track repository-internal discussion; Jira remains the requirements system of record, and this server does not sync with Jira. `list_issues` accepts only the `open` and `closed` states because Gogs v0.14.2 treats every other value as open, and it does not accept a page size because Gogs v0.14.2 fixes it server-side. The next page comes from the Gogs `Link` header and is reported as `meta.next_page` only when one exists. `list_issues` returns compact summaries without bodies; `get_issue` returns the full record with body, creator, assignee, labels, milestone, comment count, and timestamps, and reports the shared not-found code without revealing whether the repository or the issue exists. `list_issue_comments` validates the RFC3339 `since` timestamp before contacting Gogs, and bounds the result with `max_comments` (default 100, at most 500) and the 64 KiB structured-output limit; reaching either bound sets `meta.truncated` with a warning.
+
+Gogs v0.14.2 has no pull request API. `list_pull_requests`, `get_pull_request`, and `get_pull_request_diff` assemble pull request data from what Gogs does provide: the `refs/pull/{number}/head` refs on the base repository, the underlying issue, and the git protocol. All three are read-only and always registered.
+
+`list_pull_requests` lists the pull refs of a repository with `ls-remote`, newest first, and joins each with its issue metadata. The `state` filter accepts `open` (default), `closed`, and `all`; `limit` defaults to 30 and is capped at 100. Every listed entry costs one issue lookup, so the result is bounded by `limit` instead of paged.
+
+`get_pull_request` adds the body, labels, and web URL of one pull request, plus its head SHA. Gogs does not expose the target branch, so `base_ref` carries the repository default branch and `base_ref_assumed` is `true`; pass an explicit base to the diff tool when the pull request targets another branch.
+
+`get_pull_request_diff` renders the merge-base diff: the engine fetches the pull ref and the base branch into a bare cache repository under `GOGS_MCP_CACHE_DIR`, computes the merge base, and encodes the diff in the standard unified format. The result carries per-file additions and deletions, the commits between the merge base and the head, and the merge-base SHA. `max_bytes` bounds the rendered diff (default 256 KiB, at most 4 MiB); reaching it sets `meta.truncated` with a warning. `base_ref` overrides the assumed target branch, and an issue without a pull ref is rejected with `INVALID_ARGUMENT`. Git over HTTP(S) authenticates with the same token as basic auth.
+
+The diff cache has no size bound or expiry of its own; `gogs-mcp cache clean` removes it together with the snapshot cache.
 
 `create_issue`, `update_issue`, and `create_issue_comment` are only registered when `GOGS_MCP_WRITE_ENABLED` is set, so the default server advertises exactly the read-only tool list. None of them retries its write: when the response is lost after the write reached Gogs, the tool reports `WRITE_OUTCOME_UNKNOWN` and the issue or comment must be looked up instead of repeated. A plain issue needs only a title (1 through 255 characters) and an optional body of at most 1 MiB, and every user with issue-read access can create one. An assignee, labels, or a milestone requires repository push permission (`PERMISSION_DENIED` otherwise), because Gogs silently drops those fields for users without write access; the assignee, every label name, and the milestone title are verified to exist before the issue is created, and unknown references are rejected with `INVALID_ARGUMENT`. The result carries the issue number, its state, and its web URL, which `get_issue` can return.
 
@@ -140,7 +153,7 @@ Environment variables override file values.
 | `GOGS_TOKEN_FILE` | None. | Path to a private token file. |
 | `GOGS_CA_FILE` | System trust store. | Additional PEM CA certificate file. |
 | `GOGS_ALLOW_INSECURE_HTTP` | `false`. | Explicitly permits plain HTTP. |
-| `GOGS_MCP_CACHE_DIR` | OS user cache directory. | Absolute path of the snapshot cache root for `search_code`. |
+| `GOGS_MCP_CACHE_DIR` | OS user cache directory. | Absolute path of the cache root for `search_code` snapshots and pull request diffs. |
 | `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`. | Snapshot cache size per Gogs user before least-recently-used eviction. |
 | `GOGS_MCP_CACHE_TTL` | `24h`. | How long a snapshot may stay untouched before it expires. |
 | `GOGS_MCP_SEARCH_TIMEOUT` | `30s`. | Default search time limit for `search_code`, at most `5m`. |
