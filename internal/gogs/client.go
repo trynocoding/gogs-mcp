@@ -29,16 +29,22 @@ type Options struct {
 	// CacheDir hosts the git object cache of the pull request engine. When
 	// empty, the pull request tools are unavailable.
 	CacheDir string
-	Logger   *slog.Logger
+	// CacheTTL and CacheMaxBytes bound the pull request diff cache; the
+	// engine falls back to its own defaults for non-positive values.
+	CacheTTL      time.Duration
+	CacheMaxBytes int64
+	Logger        *slog.Logger
 }
 
 type Client struct {
-	apiRoot   *url.URL
-	token     string
-	userAgent string
-	http      *http.Client
-	logger    *slog.Logger
-	cacheDir  string
+	apiRoot       *url.URL
+	token         string
+	userAgent     string
+	http          *http.Client
+	logger        *slog.Logger
+	cacheDir      string
+	cacheTTL      time.Duration
+	cacheMaxBytes int64
 
 	pullMu sync.Mutex
 	pull   *PullEngine
@@ -120,12 +126,14 @@ func NewClient(options Options) (*Client, error) {
 	}
 
 	return &Client{
-		apiRoot:   cloneURL(options.APIRoot),
-		token:     options.Token,
-		userAgent: options.UserAgent,
-		http:      client,
-		logger:    logger,
-		cacheDir:  options.CacheDir,
+		apiRoot:       cloneURL(options.APIRoot),
+		token:         options.Token,
+		userAgent:     options.UserAgent,
+		http:          client,
+		logger:        logger,
+		cacheDir:      options.CacheDir,
+		cacheTTL:      options.CacheTTL,
+		cacheMaxBytes: options.CacheMaxBytes,
 	}, nil
 }
 

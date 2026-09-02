@@ -105,13 +105,15 @@ func runServe(
 		return exitConfig
 	}
 	client, err := gogs.NewClient(gogs.Options{
-		APIRoot:   cfg.APIRoot(),
-		Token:     cfg.Token,
-		CAFile:    cfg.CAFile,
-		Timeout:   cfg.HTTPTimeout,
-		UserAgent: "gogs-mcp/" + version.Version,
-		CacheDir:  cacheDir,
-		Logger:    logger,
+		APIRoot:       cfg.APIRoot(),
+		Token:         cfg.Token,
+		CAFile:        cfg.CAFile,
+		Timeout:       cfg.HTTPTimeout,
+		UserAgent:     "gogs-mcp/" + version.Version,
+		CacheDir:      cacheDir,
+		CacheTTL:      cfg.CacheTTL,
+		CacheMaxBytes: cfg.CacheMaxBytes,
+		Logger:        logger,
 	})
 	if err != nil {
 		logger.Error("Could not initialize the Gogs client.", "error", err)

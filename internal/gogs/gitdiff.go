@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,14 +57,25 @@ type PullCommit struct {
 	Date    string `json:"date"`
 }
 
+// Merge states reported in PullDiff.MergeState. The state is a heuristic
+// computed from the local object cache; only a real merge can decide the
+// outcome.
+const (
+	MergeStateFastForward = "fast_forward" // the base has not moved since the merge base, so the merge cannot conflict
+	MergeStateDiverged    = "diverged"     // both sides moved on, but no file was touched by both
+	MergeStateConflicting = "conflicting"  // both sides touched the same files; a merge may conflict
+)
+
 // PullDiff is the merge-base diff of one pull request plus everything an
 // AI reviewer needs to navigate it.
 type PullDiff struct {
-	MergeBase string         `json:"merge_base"`
-	Diff      string         `json:"diff"`
-	Files     []DiffFileStat `json:"files"`
-	Commits   []PullCommit   `json:"commits"`
-	Truncated bool           `json:"truncated"`
+	MergeBase          string         `json:"merge_base"`
+	Diff               string         `json:"diff"`
+	Files              []DiffFileStat `json:"files"`
+	Commits            []PullCommit   `json:"commits"`
+	Truncated          bool           `json:"truncated"`
+	MergeState         string         `json:"merge_state"`
+	MergeConflictPaths []string       `json:"merge_conflict_paths,omitempty"`
 }
 
 // PullEngineOptions configures the pull request engine.
@@ -72,7 +84,14 @@ type PullEngineOptions struct {
 	Username string
 	Token    string
 	Timeout  time.Duration
-	Logger   *slog.Logger
+	// CacheTTL expires diff cache repositories untouched for this long;
+	// non-positive values fall back to defaultPullCacheTTL.
+	CacheTTL time.Duration
+	// CacheMaxBytes evicts the least recently used diff cache repositories
+	// once the total exceeds this size; non-positive values fall back to
+	// defaultPullCacheMaxBytes.
+	CacheMaxBytes int64
+	Logger        *slog.Logger
 }
 
 // PullEngine computes pull request data over the native git protocol of the
@@ -80,14 +99,22 @@ type PullEngineOptions struct {
 // diffs. Fetched objects are cached under CacheDir, so repeated calls only
 // transfer what changed.
 type PullEngine struct {
-	cacheDir string
-	username string
-	token    string
-	timeout  time.Duration
-	logger   *slog.Logger
+	cacheDir      string
+	username      string
+	token         string
+	timeout       time.Duration
+	cacheTTL      time.Duration
+	cacheMaxBytes int64
+	logger        *slog.Logger
 
 	mu sync.Mutex
 }
+
+// Defaults for the diff cache bounds; they mirror the snapshot cache limits.
+const (
+	defaultPullCacheTTL      = 24 * time.Hour
+	defaultPullCacheMaxBytes = int64(2 << 30)
+)
 
 // NewPullEngine validates the options and returns a ready engine.
 func NewPullEngine(options PullEngineOptions) (*PullEngine, error) {
@@ -102,12 +129,22 @@ func NewPullEngine(options PullEngineOptions) (*PullEngine, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	cacheTTL := options.CacheTTL
+	if cacheTTL <= 0 {
+		cacheTTL = defaultPullCacheTTL
+	}
+	cacheMaxBytes := options.CacheMaxBytes
+	if cacheMaxBytes <= 0 {
+		cacheMaxBytes = defaultPullCacheMaxBytes
+	}
 	return &PullEngine{
-		cacheDir: options.CacheDir,
-		username: options.Username,
-		token:    options.Token,
-		timeout:  timeout,
-		logger:   logger,
+		cacheDir:      options.CacheDir,
+		username:      options.Username,
+		token:         options.Token,
+		timeout:       timeout,
+		cacheTTL:      cacheTTL,
+		cacheMaxBytes: cacheMaxBytes,
+		logger:        logger,
 	}, nil
 }
 
@@ -116,7 +153,7 @@ func NewPullEngine(options PullEngineOptions) (*PullEngine, error) {
 func (e *PullEngine) CleanCache() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return os.RemoveAll(filepath.Join(e.cacheDir, "pull"))
+	return os.RemoveAll(e.pullCacheRoot())
 }
 
 // ListPullRefs returns every pull request head that the repository currently
@@ -152,20 +189,26 @@ func (e *PullEngine) ListPullRefs(ctx context.Context, cloneURL *url.URL) ([]Pul
 
 // DiffPull fetches the pull request head and the base ref into the local
 // cache, then returns their merge-base diff together with the changed files
-// and the pull request commits.
-func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int64, baseRef string, maxBytes int) (*PullDiff, error) {
+// and the pull request commits. A non-empty paths restricts the rendered diff
+// to the matching files; the file stats follow the same filter while the
+// merge state always describes the whole pull request.
+func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int64, baseRef string, paths []string, maxBytes int) (*PullDiff, error) {
 	if number <= 0 {
 		return nil, &Error{Code: CodeInvalidArgument, Message: "The pull request number must be positive."}
 	}
 	if baseRef == "" {
 		return nil, &Error{Code: CodeInvalidArgument, Message: "The base ref is required."}
 	}
+	filters := normalizePathFilters(paths)
 
 	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	repoPath := e.repoPathFor(cloneURL)
+	e.sweepPullCache(time.Now(), repoPath)
 
 	repo, err := e.cachedRepo(cloneURL)
 	if err != nil {
@@ -218,20 +261,237 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	if err != nil {
 		return nil, &Error{Code: CodeGogsError, Message: "Could not read the pull request head tree.", cause: err}
 	}
+	baseTree, err := baseCommit.Tree()
+	if err != nil {
+		return nil, &Error{Code: CodeGogsError, Message: "Could not read the base ref tree.", cause: err}
+	}
 
-	changes, err := object.DiffTreeWithOptions(ctx, mergeBaseTree, headTree, &object.DiffTreeOptions{
+	headChanges, err := object.DiffTreeWithOptions(ctx, mergeBaseTree, headTree, &object.DiffTreeOptions{
 		DetectRenames: true,
 		RenameScore:   50,
 	})
 	if err != nil {
 		return nil, &Error{Code: CodeGogsError, Message: "Could not diff the pull request trees.", cause: err}
 	}
-	patch, err := changes.Patch()
+
+	mergeState, conflictPaths, err := e.mergeStateFor(ctx, repo, mergeBase.Hash, baseHash, mergeBaseTree, baseTree, headChanges)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(filters) > 0 {
+		headChanges = filterChanges(headChanges, filters)
+	}
+	patch, err := headChanges.Patch()
 	if err != nil {
 		return nil, &Error{Code: CodeGogsError, Message: "Could not build the pull request patch.", cause: err}
 	}
 
-	return buildPullDiff(patch, commits, mergeBase.Hash.String(), maxBytes)
+	touchCache(repoPath)
+	diff, err := buildPullDiff(patch, commits, mergeBase.Hash.String(), maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	diff.MergeState = mergeState
+	diff.MergeConflictPaths = conflictPaths
+	return diff, nil
+}
+
+// pullCacheRoot is the directory holding the bare cache repositories.
+func (e *PullEngine) pullCacheRoot() string {
+	return filepath.Join(e.cacheDir, "pull")
+}
+
+// repoPathFor derives the stable cache path of a clone URL. The caller must
+// hold e.mu.
+func (e *PullEngine) repoPathFor(cloneURL *url.URL) string {
+	sum := sha256.Sum256([]byte(cloneURL.String()))
+	return filepath.Join(e.pullCacheRoot(), hex.EncodeToString(sum[:8])+".git")
+}
+
+// sweepPullCache enforces the TTL and the size bound of the diff cache. The
+// repository about to be used is evicted last, and only if the cache remains
+// oversized; cachedRepo rebuilds whatever the sweep removes. Failures are
+// logged and otherwise ignored, because the sweep is an optimization rather
+// than a correctness step. The caller must hold e.mu.
+func (e *PullEngine) sweepPullCache(now time.Time, keep string) {
+	entries, err := os.ReadDir(e.pullCacheRoot())
+	if err != nil {
+		return
+	}
+	type cached struct {
+		path     string
+		size     int64
+		modified time.Time
+	}
+	alive := make([]cached, 0, len(entries))
+	var total int64
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		path := filepath.Join(e.pullCacheRoot(), entry.Name())
+		if now.Sub(info.ModTime()) > e.cacheTTL {
+			if err := os.RemoveAll(path); err != nil {
+				e.logger.Warn("Could not remove the expired pull cache repository.", "path", path, "error", err)
+				continue
+			}
+			e.logger.Info("Removed the expired pull cache repository.", "path", path)
+			continue
+		}
+		size := dirSize(path)
+		total += size
+		alive = append(alive, cached{path: path, size: size, modified: info.ModTime()})
+	}
+	if total <= e.cacheMaxBytes {
+		return
+	}
+	sort.SliceStable(alive, func(i, j int) bool {
+		return alive[i].modified.Before(alive[j].modified)
+	})
+	for _, item := range alive {
+		if total <= e.cacheMaxBytes {
+			return
+		}
+		if item.path == keep {
+			continue
+		}
+		if err := os.RemoveAll(item.path); err != nil {
+			e.logger.Warn("Could not remove the evicted pull cache repository.", "path", item.path, "error", err)
+			continue
+		}
+		total -= item.size
+		e.logger.Info("Evicted the pull cache repository.", "path", item.path)
+	}
+	if total > e.cacheMaxBytes {
+		// The cache is still oversized with only the in-use repository
+		// left; dropping it is cheaper than exceeding the bound, and the
+		// caller rebuilds it on the next fetch.
+		if err := os.RemoveAll(keep); err != nil {
+			e.logger.Warn("Could not remove the oversized pull cache repository.", "path", keep, "error", err)
+		}
+	}
+}
+
+// touchCache marks a cache repository as freshly used, which drives the TTL
+// sweep. Fetch failures leave the old timestamp in place, so an unusable
+// repository ages out.
+func touchCache(path string) {
+	now := time.Now()
+	_ = os.Chtimes(path, now, now)
+}
+
+// dirSize returns the on-disk size of a directory tree, counting unreadable
+// entries as zero.
+func dirSize(root string) int64 {
+	var total int64
+	//nolint:errcheck // a size estimate must not fail on unreadable entries
+	filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			//nolint:nilerr // unreadable entries contribute zero to the estimate
+			return nil
+		}
+		if info, err := entry.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// normalizePathFilters trims the path filters and drops the empty ones. A
+// nil result means no filtering.
+func normalizePathFilters(paths []string) []string {
+	filters := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		path = strings.TrimSuffix(path, "/")
+		if path != "" {
+			filters = append(filters, path)
+		}
+	}
+	if len(filters) == 0 {
+		return nil
+	}
+	return filters
+}
+
+// filterChanges keeps the changes whose source or destination path matches
+// one of the filters.
+func filterChanges(changes object.Changes, filters []string) object.Changes {
+	kept := make(object.Changes, 0, len(changes))
+	for _, change := range changes {
+		if matchAnyPath(change.From.Name, filters) || matchAnyPath(change.To.Name, filters) {
+			kept = append(kept, change)
+		}
+	}
+	return kept
+}
+
+// matchAnyPath reports whether the path matches one of the filters exactly or
+// as a directory prefix.
+func matchAnyPath(path string, filters []string) bool {
+	if path == "" {
+		return false
+	}
+	for _, filter := range filters {
+		if path == filter || strings.HasPrefix(path, filter+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeStateFor compares the two sides of the pull request against the merge
+// base. Only a real merge can decide the outcome, so the conflicting state
+// reports the files that both sides touched.
+func (e *PullEngine) mergeStateFor(ctx context.Context, repo *git.Repository, mergeBase, base plumbing.Hash, mergeBaseTree, baseTree *object.Tree, headChanges object.Changes) (string, []string, error) {
+	baseCommits, err := commitsSince(repo, mergeBase, base)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(baseCommits) == 0 {
+		return MergeStateFastForward, nil, nil
+	}
+
+	baseChanges, err := object.DiffTreeWithOptions(ctx, mergeBaseTree, baseTree, &object.DiffTreeOptions{
+		DetectRenames: true,
+		RenameScore:   50,
+	})
+	if err != nil {
+		return "", nil, &Error{Code: CodeGogsError, Message: "Could not diff the base ref tree.", cause: err}
+	}
+
+	headPaths := touchedPaths(headChanges)
+	var conflicts []string
+	for path := range touchedPaths(baseChanges) {
+		if headPaths[path] {
+			conflicts = append(conflicts, path)
+		}
+	}
+	if len(conflicts) > 0 {
+		sort.Strings(conflicts)
+		return MergeStateConflicting, conflicts, nil
+	}
+	return MergeStateDiverged, nil, nil
+}
+
+// touchedPaths collects the source and destination paths of the changes.
+func touchedPaths(changes object.Changes) map[string]bool {
+	paths := make(map[string]bool, len(changes))
+	for _, change := range changes {
+		if change.From.Name != "" {
+			paths[change.From.Name] = true
+		}
+		if change.To.Name != "" {
+			paths[change.To.Name] = true
+		}
+	}
+	return paths
 }
 
 // buildPullDiff renders the patch text and collects the per-file stats. The
@@ -273,8 +533,7 @@ func buildPullDiff(patch *object.Patch, commits []PullCommit, mergeBase string, 
 // cachedRepo opens the bare cache repository for the clone URL, recreating
 // it whenever it is missing or unusable. The caller must hold e.mu.
 func (e *PullEngine) cachedRepo(cloneURL *url.URL) (*git.Repository, error) {
-	sum := sha256.Sum256([]byte(cloneURL.String()))
-	repoPath := filepath.Join(e.cacheDir, "pull", hex.EncodeToString(sum[:8])+".git")
+	repoPath := e.repoPathFor(cloneURL)
 
 	repo, openErr := git.PlainOpen(repoPath)
 	if openErr == nil {

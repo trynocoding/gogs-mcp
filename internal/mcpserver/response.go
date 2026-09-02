@@ -263,12 +263,14 @@ type PullCommit struct {
 }
 
 type PullRequestDiffPage struct {
-	Number         int64          `json:"number"`
-	BaseRef        string         `json:"base_ref"`
-	BaseRefAssumed bool           `json:"base_ref_assumed"`
-	MergeBase      string         `json:"merge_base"`
-	Diff           string         `json:"diff"`
-	Files          []DiffFileStat `json:"files"`
-	Commits        []PullCommit   `json:"commits"`
-	Truncated      bool           `json:"truncated"`
+	Number             int64          `json:"number"`
+	BaseRef            string         `json:"base_ref"`
+	BaseRefAssumed     bool           `json:"base_ref_assumed"`
+	MergeBase          string         `json:"merge_base"`
+	Diff               string         `json:"diff"`
+	Files              []DiffFileStat `json:"files"`
+	Commits            []PullCommit   `json:"commits"`
+	Truncated          bool           `json:"truncated"`
+	MergeState         string         `json:"merge_state"`
+	MergeConflictPaths []string       `json:"merge_conflict_paths,omitempty"`
 }

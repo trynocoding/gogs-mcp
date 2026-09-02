@@ -93,11 +93,13 @@ func TestDiffPullProducesStandardUnifiedDiff(t *testing.T) {
 	fixtureURL, mainHash, headHash := buildPullFixture(t)
 	engine := newTestPullEngine(t)
 
-	diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", 0)
+	diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", nil, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, mainHash.String(), diff.MergeBase)
 	assert.False(t, diff.Truncated)
+	// The base branch has not moved past the merge base.
+	assert.Equal(t, MergeStateFastForward, diff.MergeState)
 
 	require.Len(t, diff.Files, 3)
 	// Entries follow the lexicographic order of the unified diff.
@@ -118,7 +120,7 @@ func TestDiffPullTruncatesAtByteLimit(t *testing.T) {
 	fixtureURL, _, _ := buildPullFixture(t)
 	engine := newTestPullEngine(t)
 
-	diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", 120)
+	diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", nil, 120)
 	require.NoError(t, err)
 	assert.True(t, diff.Truncated)
 	assert.LessOrEqual(t, len(diff.Diff), 120)
@@ -132,15 +134,15 @@ func TestDiffPullRejectsBadArguments(t *testing.T) {
 	engine := newTestPullEngine(t)
 	ctx := context.Background()
 
-	_, err := engine.DiffPull(ctx, fixtureURL, 0, "main", 0)
+	_, err := engine.DiffPull(ctx, fixtureURL, 0, "main", nil, 0)
 	require.Error(t, err)
 	assert.Equal(t, CodeInvalidArgument, AsError(err).Code)
 
-	_, err = engine.DiffPull(ctx, fixtureURL, 1, "", 0)
+	_, err = engine.DiffPull(ctx, fixtureURL, 1, "", nil, 0)
 	require.Error(t, err)
 	assert.Equal(t, CodeInvalidArgument, AsError(err).Code)
 
-	_, err = engine.DiffPull(ctx, fixtureURL, 1, "no-such-branch", 0)
+	_, err = engine.DiffPull(ctx, fixtureURL, 1, "no-such-branch", nil, 0)
 	require.Error(t, err)
 	assert.Equal(t, CodeInvalidArgument, AsError(err).Code)
 }
@@ -151,14 +153,14 @@ func TestDiffPullReusesCacheRepository(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 
-	_, err = engine.DiffPull(ctx, fixtureURL, 1, "main", 0)
+	_, err = engine.DiffPull(ctx, fixtureURL, 1, "main", nil, 0)
 	require.NoError(t, err)
 	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
 	// A second call must not create another cache repository.
-	_, err = engine.DiffPull(ctx, fixtureURL, 1, "main", 0)
+	_, err = engine.DiffPull(ctx, fixtureURL, 1, "main", nil, 0)
 	require.NoError(t, err)
 	entries, err = os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
 	require.NoError(t, err)
@@ -214,4 +216,185 @@ func TestTruncateToLastLine(t *testing.T) {
 			assert.LessOrEqual(t, buffer.Len(), testCase.maxBytes)
 		})
 	}
+}
+
+// buildDivergedPullFixture extends the pull request fixture with a commit on
+// the base branch, so the merge base no longer equals the base tip. When
+// baseTouchesCommon is set, the base commit rewrites file.txt, which the head
+// branch also touches; otherwise the base commit only adds a separate file.
+func buildDivergedPullFixture(t *testing.T, baseTouchesCommon bool) *url.URL {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+
+	signature := &object.Signature{Name: "Reader", Email: "reader@example.com", When: time.Now()}
+	writeFile := func(name, content string) {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		_, err := worktree.Add(name)
+		require.NoError(t, err)
+	}
+
+	writeFile("file.txt", "one\ntwo\n")
+	_, err = worktree.Commit("Base", &git.CommitOptions{Author: signature, AllowEmptyCommits: true})
+	require.NoError(t, err)
+
+	require.NoError(t, worktree.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName("main"),
+		Create: true,
+	}))
+	require.NoError(t, worktree.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName("pr-branch"),
+		Create: true,
+	}))
+	writeFile("file.txt", "one\ntwo v2\n")
+	headHash, err := worktree.Commit("Pull change", &git.CommitOptions{Author: signature, AllowEmptyCommits: true})
+	require.NoError(t, err)
+
+	require.NoError(t, worktree.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("main")}))
+	if baseTouchesCommon {
+		writeFile("file.txt", "one\ntwo v3\n")
+	} else {
+		writeFile("docs.md", "documentation\n")
+	}
+	_, err = worktree.Commit("Base moves on", &git.CommitOptions{Author: signature, AllowEmptyCommits: true})
+	require.NoError(t, err)
+
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.ReferenceName("refs/pull/1/head"), headHash)))
+
+	return &url.URL{Scheme: "file", Path: dir}
+}
+
+func TestDiffPullReportsMergeStates(t *testing.T) {
+	t.Run("fast forward", func(t *testing.T) {
+		fixtureURL, _, _ := buildPullFixture(t)
+		engine := newTestPullEngine(t)
+		diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", nil, 0)
+		require.NoError(t, err)
+		assert.Equal(t, MergeStateFastForward, diff.MergeState)
+		assert.Empty(t, diff.MergeConflictPaths)
+	})
+
+	t.Run("diverged", func(t *testing.T) {
+		fixtureURL := buildDivergedPullFixture(t, false)
+		engine := newTestPullEngine(t)
+		diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", nil, 0)
+		require.NoError(t, err)
+		assert.Equal(t, MergeStateDiverged, diff.MergeState)
+		assert.Empty(t, diff.MergeConflictPaths)
+	})
+
+	t.Run("conflicting", func(t *testing.T) {
+		fixtureURL := buildDivergedPullFixture(t, true)
+		engine := newTestPullEngine(t)
+		diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", nil, 0)
+		require.NoError(t, err)
+		assert.Equal(t, MergeStateConflicting, diff.MergeState)
+		assert.Equal(t, []string{"file.txt"}, diff.MergeConflictPaths)
+	})
+}
+
+func TestDiffPullFiltersByPath(t *testing.T) {
+	fixtureURL, _, _ := buildPullFixture(t)
+	engine := newTestPullEngine(t)
+	ctx := context.Background()
+
+	diff, err := engine.DiffPull(ctx, fixtureURL, 1, "main", []string{"file.txt"}, 0)
+	require.NoError(t, err)
+	require.Len(t, diff.Files, 1)
+	assert.Equal(t, "file.txt", diff.Files[0].Path)
+	assert.Contains(t, diff.Diff, "diff --git a/file.txt b/file.txt")
+	assert.NotContains(t, diff.Diff, "new.txt")
+	// The commit list is not filtered, and the merge state keeps describing
+	// the whole pull request.
+	require.Len(t, diff.Commits, 1)
+	assert.Equal(t, MergeStateFastForward, diff.MergeState)
+
+	// A trailing slash selects everything under a directory; the cache
+	// repository is stored under a .git suffix directory that must not leak
+	// into the results.
+	diff, err = engine.DiffPull(ctx, fixtureURL, 1, "main", []string{"old.txt", "docs/"}, 0)
+	require.NoError(t, err)
+	require.Len(t, diff.Files, 1)
+	assert.Equal(t, "old.txt", diff.Files[0].Path)
+
+	diff, err = engine.DiffPull(ctx, fixtureURL, 1, "main", []string{"   ", ""}, 0)
+	require.NoError(t, err)
+	assert.Len(t, diff.Files, 3, "blank filters must not filter anything")
+}
+
+func TestDiffPullWarnsWhenFiltersMatchNothing(t *testing.T) {
+	fixtureURL, _, _ := buildPullFixture(t)
+	engine := newTestPullEngine(t)
+
+	diff, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", []string{"absent/"}, 0)
+	require.NoError(t, err)
+	assert.Empty(t, diff.Files)
+	assert.Empty(t, diff.Diff)
+	assert.Equal(t, MergeStateFastForward, diff.MergeState)
+}
+
+func TestSweepPullCacheEvictsExpiredAndOversizedRepositories(t *testing.T) {
+	newCache := func(t *testing.T, ttl time.Duration, maxBytes int64) (*PullEngine, string, string) {
+		t.Helper()
+		root := filepath.Join(t.TempDir(), "pull")
+		stale := filepath.Join(root, "stale.git")
+		fresh := filepath.Join(root, "fresh.git")
+		for _, path := range []string{stale, fresh} {
+			require.NoError(t, os.MkdirAll(path, 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(path, "objects.pack"), []byte("payload"), 0o644))
+		}
+		engine, err := NewPullEngine(PullEngineOptions{
+			CacheDir:      filepath.Dir(root),
+			CacheTTL:      ttl,
+			CacheMaxBytes: maxBytes,
+		})
+		require.NoError(t, err)
+		return engine, stale, fresh
+	}
+
+	t.Run("expired by ttl", func(t *testing.T) {
+		engine, stale, fresh := newCache(t, time.Hour, 0)
+		old := time.Now().Add(-2 * time.Hour)
+		require.NoError(t, os.Chtimes(stale, old, old))
+		engine.sweepPullCache(time.Now(), fresh)
+		assert.NoDirExists(t, stale)
+		assert.DirExists(t, fresh)
+	})
+
+	t.Run("evicted by capacity oldest first", func(t *testing.T) {
+		// Each repository payload is 7 bytes; a limit of 8 fits exactly one.
+		engine, stale, fresh := newCache(t, time.Hour, 8)
+		// fresh is newer, so stale must go first; the freed bytes then cover
+		// the kept repository.
+		now := time.Now()
+		require.NoError(t, os.Chtimes(stale, now.Add(-time.Minute), now.Add(-time.Minute)))
+		engine.sweepPullCache(now, fresh)
+		assert.NoDirExists(t, stale)
+		assert.DirExists(t, fresh)
+	})
+
+	t.Run("kept repository is dropped when nothing else fits", func(t *testing.T) {
+		engine, _, fresh := newCache(t, time.Hour, 1)
+		engine.sweepPullCache(time.Now(), fresh)
+		assert.NoDirExists(t, fresh)
+	})
+
+	t.Run("untouched within ttl", func(t *testing.T) {
+		engine, stale, fresh := newCache(t, time.Hour, 0)
+		engine.sweepPullCache(time.Now(), fresh)
+		assert.DirExists(t, stale)
+	})
+}
+
+func TestNewPullEngineDefaultsCacheBounds(t *testing.T) {
+	engine, err := NewPullEngine(PullEngineOptions{CacheDir: t.TempDir(), CacheTTL: -time.Second, CacheMaxBytes: -1})
+	require.NoError(t, err)
+	assert.Equal(t, defaultPullCacheTTL, engine.cacheTTL)
+	assert.Equal(t, defaultPullCacheMaxBytes, engine.cacheMaxBytes)
 }

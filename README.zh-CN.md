@@ -22,7 +22,7 @@ Gogs MCP 是一个本地 stdio MCP 服务器，对接 Gogs v0.14.2。默认只�
 | `list_issue_comments` | 按创建顺序列出一个 issue 的评论，可以用 RFC3339 时间戳只取某个时刻之后的评论。 |
 | `list_pull_requests` | 列出一个仓库的 pull request：标题、作者、状态、评论数、时间戳和头提交 SHA，数据来自 pull 引用和对应的 issue。 |
 | `get_pull_request` | 返回单个 pull request 的正文、标签、头提交 SHA 和 web URL。目标分支默认取仓库默认分支，由 `base_ref_assumed` 标注。 |
-| `get_pull_request_diff` | 渲染单个 pull request 的 merge-base diff：标准 unified 格式，带逐文件统计、提交列表和字节上限。 |
+| `get_pull_request_diff` | 渲染单个 pull request 的 merge-base diff：标准 unified 格式，带逐文件统计、提交列表、路径过滤、字节上限和启发式 merge state。 |
 | `create_issue` | 创建 issue，标题必填，正文可选。仅在设置了 `GOGS_MCP_WRITE_ENABLED` 时注册。 |
 | `update_issue` | 更新一个 issue 的标题、正文、状态、指派人或里程碑。仅在设置了 `GOGS_MCP_WRITE_ENABLED` 时注册。 |
 | `create_issue_comment` | 为一个 issue 添加评论。仅在设置了 `GOGS_MCP_WRITE_ENABLED` 时注册。 |
@@ -93,9 +93,9 @@ Gogs v0.14.2 没有 pull request API。`list_pull_requests`、`get_pull_request`
 
 `get_pull_request` 补上正文、标签和 web URL，外加头提交 SHA。目标分支在 API 里拿不到，`base_ref` 填的是仓库默认分支，`base_ref_assumed` 为 `true`；pull request 实际指向别的分支时，给 diff 工具显式传 base。
 
-`get_pull_request_diff` 渲染 merge-base diff：引擎把 pull 引用和 base 分支 fetch 到 `GOGS_MCP_CACHE_DIR` 下的裸缓存仓库，算出 merge base，再按标准 unified 格式编码。结果带每个文件的新增/删除行数、merge base 到头提交之间的提交列表和 merge-base SHA。`max_bytes` 限制渲染出的 diff 大小（默认 256 KiB，至多 4 MiB），触顶时 `meta.truncated` 置位并附警告。`base_ref` 可以覆盖假定的目标分支；没有 pull 引用的 issue 返回 `INVALID_ARGUMENT`。git 走 HTTP(S) 时用同一个令牌做 basic auth。
+`get_pull_request_diff` 渲染 merge-base diff：引擎把 pull 引用和 base 分支 fetch 到 `GOGS_MCP_CACHE_DIR` 下的裸缓存仓库，算出 merge base，再按标准 unified 格式编码。结果带每个文件的新增/删除行数、merge base 到头提交之间的提交列表和 merge-base SHA。`max_bytes` 限制渲染出的 diff 大小（默认 256 KiB，至多 4 MiB），触顶时 `meta.truncated` 置位并附警告。`base_ref` 可以覆盖假定的目标分支；没有 pull 引用的 issue 返回 `INVALID_ARGUMENT`。可选的 `paths` 列表把渲染出的 diff 和文件统计限制在匹配路径内——尾斜杠匹配整个目录——而 merge state 始终描述整个 pull request；一条路径都没匹配上时返回空 diff 并附警告。`merge_state` 在 base 分支没有越过 merge base 时报 `fast_forward`，两侧都有新提交但没碰同一个文件时报 `diverged`，两侧都改了同一个文件时报 `conflicting` 并把涉及路径列在 `merge_conflict_paths`。这个状态是从两侧改动文件列表推出的启发式，不是真的执行合并，警告里会说明。git 走 HTTP(S) 时用同一个令牌做 basic auth。
 
-diff 缓存自己没有容量上限和过期时间，`gogs-mcp cache clean` 会把它和快照缓存一起清掉。
+diff 缓存与快照缓存共用上限：24 小时（`GOGS_MCP_CACHE_TTL`）没被动过的仓库过期，缓存超过 2 GiB（`GOGS_MCP_CACHE_MAX_BYTES`）时按最近最少使用淘汰；正在 diff 的仓库只有在腾不出任何空间时才会被移除。`gogs-mcp cache clean` 会把它和快照缓存一起清掉。
 
 `create_issue`、`update_issue` 和 `create_issue_comment` 仅在设置 `GOGS_MCP_WRITE_ENABLED` 时注册，所以默认服务器提供的工具清单是纯只读的。三个工具都不会自动重试：如果写请求已经到达 Gogs 但响应丢了，工具会报 `WRITE_OUTCOME_UNKNOWN`，这时应该去查 issue 或评论确认结果，而不是再写一次。创建普通 issue 只需要标题（1 到 255 字符），正文可选、最大 1 MiB；只要有读 issue 的权限就能建。要设置指派人、标签或里程碑，需要仓库的 push 权限，否则报 `PERMISSION_DENIED`——因为 Gogs 会悄悄丢弃无写权限用户的这些字段。指派人、每个标签名和里程碑标题会先验证存在，引用不存在时返回 `INVALID_ARGUMENT`。结果里有 issue 编号、状态和 web URL，可以用 `get_issue` 再查。
 
@@ -156,8 +156,8 @@ claude mcp add gogs \
 | `GOGS_CA_FILE` | 系统信任库。 | 额外的 PEM CA 证书文件。 |
 | `GOGS_ALLOW_INSECURE_HTTP` | `false`。 | 显式允许纯 HTTP。 |
 | `GOGS_MCP_CACHE_DIR` | OS 用户缓存目录。 | `search_code` 快照与 pull request diff 缓存根的绝对路径。 |
-| `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`。 | 每个用户快照缓存的容量上限，超过后按最近最少使用淘汰。 |
-| `GOGS_MCP_CACHE_TTL` | `24h`。 | 快照多久没被使用就过期。 |
+| `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`。 | 每个用户缓存的容量上限，超过后按最近最少使用淘汰；覆盖 search 快照和 pull request diff。 |
+| `GOGS_MCP_CACHE_TTL` | `24h`。 | 快照或 pull request 缓存条目多久没被使用就过期。 |
 | `GOGS_MCP_SEARCH_TIMEOUT` | `30s`。 | `search_code` 的默认搜索时限，至多 `5m`。 |
 | `GOGS_MCP_MAX_FILE_BYTES` | `1048576`。 | 超过这个大小的文件会被 `search_code` 跳过。 |
 | `GOGS_MCP_WRITE_ENABLED` | `false`。 | 注册 `create_issue`、`update_issue` 和 `create_issue_comment`。 |

@@ -2,6 +2,8 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"gogs-mcp/internal/gogs"
 
@@ -34,11 +36,12 @@ type getPullRequestInput struct {
 }
 
 type getPullRequestDiffInput struct {
-	Owner    string `json:"owner"`
-	Repo     string `json:"repo"`
-	Number   int64  `json:"number"`
-	BaseRef  string `json:"base_ref,omitempty"`
-	MaxBytes int    `json:"max_bytes,omitempty"`
+	Owner    string   `json:"owner"`
+	Repo     string   `json:"repo"`
+	Number   int64    `json:"number"`
+	BaseRef  string   `json:"base_ref,omitempty"`
+	Paths    []string `json:"paths,omitempty"`
+	MaxBytes int      `json:"max_bytes,omitempty"`
 }
 
 func registerPullTools(server *mcp.Server, client Client) {
@@ -92,13 +95,13 @@ func registerPullTools(server *mcp.Server, client Client) {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_pull_request_diff",
-		Description: "Return the merge-base unified diff, the changed files with additions and deletions, and the commits of one pull request. The diff is fetched over the git protocol and cached locally; use base_ref to diff against a branch other than the repository default branch. " + pullToolScope,
+		Description: "Return the merge-base unified diff, the changed files with additions and deletions, and the commits of one pull request. The merge_state field heuristically reports whether the merge can conflict. The diff is fetched over the git protocol and cached locally; use base_ref to diff against a branch other than the repository default branch, and paths to restrict the diff to specific files. " + pullToolScope,
 		Annotations: readOnlyAnnotations("Get pull request diff"),
 		InputSchema: getPullRequestDiffInputSchema(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input getPullRequestDiffInput) (*mcp.CallToolResult, ToolResponse[PullRequestDiffPage], error) {
 		requestID := newRequestID()
 		ctx = gogs.WithRequestMetadata(ctx, requestID, "get_pull_request_diff")
-		diff, err := client.GetPullRequestDiff(ctx, input.Owner, input.Repo, input.Number, input.BaseRef, input.MaxBytes)
+		diff, err := client.GetPullRequestDiff(ctx, input.Owner, input.Repo, input.Number, input.BaseRef, input.Paths, input.MaxBytes)
 		if err != nil {
 			result, response := contentError[PullRequestDiffPage](requestID, err)
 			return result, response, nil
@@ -111,16 +114,24 @@ func registerPullTools(server *mcp.Server, client Client) {
 		if diff.BaseRefAssumed {
 			meta.Warnings = append(meta.Warnings, "Gogs does not expose the pull request target branch; the diff uses the repository default branch. Pass base_ref to override it.")
 		}
+		if diff.MergeState == gogs.MergeStateConflicting {
+			meta.Warnings = append(meta.Warnings, fmt.Sprintf("The pull request head and the base branch both touch %s, so the merge may conflict; this is a heuristic from the changed file lists, and only a real merge can decide the outcome.", quotedPathList(diff.MergeConflictPaths)))
+		}
+		if len(input.Paths) > 0 && len(diff.Files) == 0 {
+			meta.Warnings = append(meta.Warnings, "No changes matched the requested paths; the merge state still describes the whole pull request.")
+		}
 		return nil, ToolResponse[PullRequestDiffPage]{
 			Data: &PullRequestDiffPage{
-				Number:         diff.Number,
-				BaseRef:        diff.BaseRef,
-				BaseRefAssumed: diff.BaseRefAssumed,
-				MergeBase:      diff.MergeBase,
-				Diff:           diff.Diff,
-				Files:          mapDiffFiles(diff.Files),
-				Commits:        mapPullCommits(diff.Commits),
-				Truncated:      diff.Truncated,
+				Number:             diff.Number,
+				BaseRef:            diff.BaseRef,
+				BaseRefAssumed:     diff.BaseRefAssumed,
+				MergeBase:          diff.MergeBase,
+				Diff:               diff.Diff,
+				Files:              mapDiffFiles(diff.Files),
+				Commits:            mapPullCommits(diff.Commits),
+				Truncated:          diff.Truncated,
+				MergeState:         diff.MergeState,
+				MergeConflictPaths: diff.MergeConflictPaths,
 			},
 			Meta: meta,
 		}, nil
@@ -200,6 +211,16 @@ func mapPullCommits(commits []gogs.PullCommit) []PullCommit {
 	return entries
 }
 
+// quotedPathList renders file paths for warning text, for example
+// `ops/ops.go`, `main.go`.
+func quotedPathList(paths []string) string {
+	quoted := make([]string, len(paths))
+	for index, path := range paths {
+		quoted[index] = "`" + path + "`"
+	}
+	return strings.Join(quoted, ", ")
+}
+
 func listPullRequestsInputSchema() *jsonschema.Schema {
 	properties := repositoryIdentityProperties()
 	properties["state"] = &jsonschema.Schema{
@@ -221,6 +242,12 @@ func getPullRequestDiffInputSchema() *jsonschema.Schema {
 	properties := repositoryIdentityProperties()
 	properties["number"] = integerSchema("Pull request number.", 1, 0)
 	properties["base_ref"] = stringSchema("Branch to diff against. Defaults to the repository default branch, which is not guaranteed to be the pull request target.", false, false)
+	properties["paths"] = &jsonschema.Schema{
+		Type:        "array",
+		Description: "Restrict the rendered diff and file stats to these repository paths. A path without a trailing slash matches one file exactly; a trailing slash matches everything under that directory. The merge state always describes the whole pull request.",
+		Items:       &jsonschema.Schema{Type: "string", MinLength: intPointer(1)},
+		MaxItems:    intPointer(100),
+	}
 	properties["max_bytes"] = integerSchema("Maximum rendered diff size in bytes, from 1 through 4194304.", defaultDiffMaxBytes, maximumDiffMaxBytes)
 	return objectSchema(properties, []string{"owner", "repo", "number"})
 }

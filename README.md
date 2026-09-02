@@ -20,7 +20,7 @@ Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tool
 | `list_issue_comments` | List the comments of one issue in creation order, optionally restricted to comments since an RFC3339 timestamp. |
 | `list_pull_requests` | List the pull requests of a repository with title, author, state, comment count, timestamps, and head SHA, assembled from the pull refs and their issues. |
 | `get_pull_request` | Return one pull request with body, labels, head SHA, and web URL. The target branch is the repository default branch, flagged by `base_ref_assumed`. |
-| `get_pull_request_diff` | Render the merge-base diff of one pull request as a standard unified diff with per-file stats, the commit list, and a byte limit. |
+| `get_pull_request_diff` | Render the merge-base diff of one pull request as a standard unified diff with per-file stats, the commit list, a path filter, a byte limit, and a heuristic merge state. |
 | `create_issue` | Create an issue with a title and an optional body. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
 | `update_issue` | Update the title, body, state, assignee, or milestone of one issue. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
 | `create_issue_comment` | Add a comment to one issue. Only registered when `GOGS_MCP_WRITE_ENABLED` is set. |
@@ -91,9 +91,9 @@ Gogs v0.14.2 has no pull request API. `list_pull_requests`, `get_pull_request`, 
 
 `get_pull_request` adds the body, labels, and web URL of one pull request, plus its head SHA. Gogs does not expose the target branch, so `base_ref` carries the repository default branch and `base_ref_assumed` is `true`; pass an explicit base to the diff tool when the pull request targets another branch.
 
-`get_pull_request_diff` renders the merge-base diff: the engine fetches the pull ref and the base branch into a bare cache repository under `GOGS_MCP_CACHE_DIR`, computes the merge base, and encodes the diff in the standard unified format. The result carries per-file additions and deletions, the commits between the merge base and the head, and the merge-base SHA. `max_bytes` bounds the rendered diff (default 256 KiB, at most 4 MiB); reaching it sets `meta.truncated` with a warning. `base_ref` overrides the assumed target branch, and an issue without a pull ref is rejected with `INVALID_ARGUMENT`. Git over HTTP(S) authenticates with the same token as basic auth.
+`get_pull_request_diff` renders the merge-base diff: the engine fetches the pull ref and the base branch into a bare cache repository under `GOGS_MCP_CACHE_DIR`, computes the merge base, and encodes the diff in the standard unified format. The result carries per-file additions and deletions, the commits between the merge base and the head, and the merge-base SHA. `max_bytes` bounds the rendered diff (default 256 KiB, at most 4 MiB); reaching it sets `meta.truncated` with a warning. `base_ref` overrides the assumed target branch, and an issue without a pull ref is rejected with `INVALID_ARGUMENT`. The optional `paths` list restricts the rendered diff and file stats to matching paths — a trailing slash selects a whole directory — while the merge state keeps describing the whole pull request; a filter that matches nothing returns an empty diff with a warning. The `merge_state` field reports `fast_forward` when the base branch has not moved past the merge base, `diverged` when both sides moved on without touching the same file, and `conflicting` with the affected paths in `merge_conflict_paths` when both sides touched the same files. The state is a heuristic from the changed file lists, not a real merge; the warning says so. Git over HTTP(S) authenticates with the same token as basic auth.
 
-The diff cache has no size bound or expiry of its own; `gogs-mcp cache clean` removes it together with the snapshot cache.
+The diff cache shares the snapshot cache bounds: entries untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) expire and the least recently used repositories are removed once the cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`); the repository being diffed is only dropped when nothing else fits. `gogs-mcp cache clean` removes it together with the snapshot cache.
 
 `create_issue`, `update_issue`, and `create_issue_comment` are only registered when `GOGS_MCP_WRITE_ENABLED` is set, so the default server advertises exactly the read-only tool list. None of them retries its write: when the response is lost after the write reached Gogs, the tool reports `WRITE_OUTCOME_UNKNOWN` and the issue or comment must be looked up instead of repeated. A plain issue needs only a title (1 through 255 characters) and an optional body of at most 1 MiB, and every user with issue-read access can create one. An assignee, labels, or a milestone requires repository push permission (`PERMISSION_DENIED` otherwise), because Gogs silently drops those fields for users without write access; the assignee, every label name, and the milestone title are verified to exist before the issue is created, and unknown references are rejected with `INVALID_ARGUMENT`. The result carries the issue number, its state, and its web URL, which `get_issue` can return.
 
@@ -154,8 +154,8 @@ Environment variables override file values.
 | `GOGS_CA_FILE` | System trust store. | Additional PEM CA certificate file. |
 | `GOGS_ALLOW_INSECURE_HTTP` | `false`. | Explicitly permits plain HTTP. |
 | `GOGS_MCP_CACHE_DIR` | OS user cache directory. | Absolute path of the cache root for `search_code` snapshots and pull request diffs. |
-| `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`. | Snapshot cache size per Gogs user before least-recently-used eviction. |
-| `GOGS_MCP_CACHE_TTL` | `24h`. | How long a snapshot may stay untouched before it expires. |
+| `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`. | Cache size per Gogs user before least-recently-used eviction; covers search snapshots and pull request diffs. |
+| `GOGS_MCP_CACHE_TTL` | `24h`. | How long a snapshot or pull request cache entry may stay untouched before it expires. |
 | `GOGS_MCP_SEARCH_TIMEOUT` | `30s`. | Default search time limit for `search_code`, at most `5m`. |
 | `GOGS_MCP_MAX_FILE_BYTES` | `1048576`. | Files larger than this are skipped by `search_code`. |
 | `GOGS_MCP_WRITE_ENABLED` | `false`. | Register `create_issue`, `update_issue`, and `create_issue_comment`. |

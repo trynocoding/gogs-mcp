@@ -107,6 +107,7 @@ type fakeClient struct {
 	pullDiffCalls      int
 	pullDiffNumber     int64
 	pullDiffBaseRef    string
+	pullDiffPaths      []string
 	pullDiffMaxBytes   int
 }
 
@@ -245,10 +246,11 @@ func (c *fakeClient) GetPullRequest(_ context.Context, _, _ string, number int64
 	return c.pull, c.getPullErr
 }
 
-func (c *fakeClient) GetPullRequestDiff(_ context.Context, _, _ string, number int64, baseRef string, maxBytes int) (gogs.PullRequestDiff, error) {
+func (c *fakeClient) GetPullRequestDiff(_ context.Context, _, _ string, number int64, baseRef string, paths []string, maxBytes int) (gogs.PullRequestDiff, error) {
 	c.pullDiffCalls++
 	c.pullDiffNumber = number
 	c.pullDiffBaseRef = baseRef
+	c.pullDiffPaths = paths
 	c.pullDiffMaxBytes = maxBytes
 	return c.pullDiff, c.pullDiffErr
 }

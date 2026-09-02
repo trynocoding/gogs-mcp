@@ -16,6 +16,8 @@ const (
 	maximumPullLimit = 100
 	// defaultDiffMaxBytes bounds the rendered diff of get_pull_request_diff.
 	defaultDiffMaxBytes = 256 * 1024
+	// maximumDiffPaths bounds the path filter of get_pull_request_diff.
+	maximumDiffPaths = 100
 )
 
 // PullRequestState values accepted by the pull request listing.
@@ -59,16 +61,19 @@ type PullRequest struct {
 	BaseRefAssumed bool
 }
 
-// PullRequestDiff is the merge-base diff of one pull request.
+// PullRequestDiff is the merge-base diff of one pull request. The merge
+// state describes the whole pull request even when paths filtered the diff.
 type PullRequestDiff struct {
-	Number         int64
-	BaseRef        string
-	BaseRefAssumed bool
-	MergeBase      string
-	Diff           string
-	Files          []DiffFileStat
-	Commits        []PullCommit
-	Truncated      bool
+	Number             int64
+	BaseRef            string
+	BaseRefAssumed     bool
+	MergeBase          string
+	Diff               string
+	Files              []DiffFileStat
+	Commits            []PullCommit
+	Truncated          bool
+	MergeState         string
+	MergeConflictPaths []string
 }
 
 // ListPullRequests returns the most recent pull requests of a repository in
@@ -162,8 +167,16 @@ func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, number 
 // GetPullRequestDiff returns the merge-base diff of one pull request. An
 // empty baseRef resolves to the repository default branch, which is only an
 // assumption because Gogs v0.14.2 does not expose the target branch of a
-// pull request; callers can override it through baseRef.
-func (c *Client) GetPullRequestDiff(ctx context.Context, owner, repo string, number int64, baseRef string, maxBytes int) (PullRequestDiff, error) {
+// pull request; callers can override it through baseRef. A non-empty paths
+// restricts the rendered diff to the matching files, while the merge state
+// always describes the whole pull request.
+func (c *Client) GetPullRequestDiff(ctx context.Context, owner, repo string, number int64, baseRef string, paths []string, maxBytes int) (PullRequestDiff, error) {
+	if len(paths) > maximumDiffPaths {
+		return PullRequestDiff{}, &Error{
+			Code:    CodeInvalidArgument,
+			Message: fmt.Sprintf("The path filter accepts at most %d paths.", maximumDiffPaths),
+		}
+	}
 	if _, err := c.pullHeadRef(ctx, owner, repo, number); err != nil {
 		return PullRequestDiff{}, err
 	}
@@ -190,19 +203,21 @@ func (c *Client) GetPullRequestDiff(ctx context.Context, owner, repo string, num
 	if err != nil {
 		return PullRequestDiff{}, err
 	}
-	diff, err := engine.DiffPull(ctx, c.gitCloneURL(owner, repo), number, baseRef, maxBytes)
+	diff, err := engine.DiffPull(ctx, c.gitCloneURL(owner, repo), number, baseRef, paths, maxBytes)
 	if err != nil {
 		return PullRequestDiff{}, err
 	}
 	return PullRequestDiff{
-		Number:         number,
-		BaseRef:        baseRef,
-		BaseRefAssumed: assumed,
-		MergeBase:      diff.MergeBase,
-		Diff:           diff.Diff,
-		Files:          diff.Files,
-		Commits:        diff.Commits,
-		Truncated:      diff.Truncated,
+		Number:             number,
+		BaseRef:            baseRef,
+		BaseRefAssumed:     assumed,
+		MergeBase:          diff.MergeBase,
+		Diff:               diff.Diff,
+		Files:              diff.Files,
+		Commits:            diff.Commits,
+		Truncated:          diff.Truncated,
+		MergeState:         diff.MergeState,
+		MergeConflictPaths: diff.MergeConflictPaths,
 	}, nil
 }
 
@@ -266,10 +281,12 @@ func (c *Client) pullEngine(ctx context.Context) (*PullEngine, error) {
 		return nil, err
 	}
 	engine, err := NewPullEngine(PullEngineOptions{
-		CacheDir: c.cacheDir,
-		Username: user.Username,
-		Token:    c.token,
-		Logger:   c.logger,
+		CacheDir:      c.cacheDir,
+		Username:      user.Username,
+		Token:         c.token,
+		CacheTTL:      c.cacheTTL,
+		CacheMaxBytes: c.cacheMaxBytes,
+		Logger:        c.logger,
 	})
 	if err != nil {
 		return nil, &Error{Code: CodeInternal, Message: "Could not initialize the pull request engine.", cause: err}

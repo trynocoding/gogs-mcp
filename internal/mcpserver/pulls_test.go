@@ -210,3 +210,69 @@ func TestPullToolErrorsSurfaceAsToolErrors(t *testing.T) {
 	require.NotNil(t, getOutput.Error)
 	assert.Equal(t, "INVALID_ARGUMENT", getOutput.Error.Code)
 }
+
+func TestGetPullRequestDiffPassesPathFilterAndMergeState(t *testing.T) {
+	client := &fakeClient{
+		pullDiff: gogs.PullRequestDiff{
+			Number:     1,
+			BaseRef:    "main",
+			MergeBase:  "8bb8836",
+			Diff:       "diff --git a/ops/ops.go b/ops/ops.go\n...",
+			Files:      []gogs.DiffFileStat{{Path: "ops/ops.go", Status: "modified", Additions: 4, Deletions: 2}},
+			Commits:    []gogs.PullCommit{{SHA: "987c169", Message: "Add multiply operation"}},
+			MergeState: gogs.MergeStateDiverged,
+		},
+	}
+	session := connectTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "get_pull_request_diff",
+		Arguments: map[string]any{
+			"owner": "owner", "repo": "calculator", "number": 1, "paths": []string{"ops/", "main.go"},
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+	assert.Equal(t, []string{"ops/", "main.go"}, client.pullDiffPaths)
+
+	var output ToolResponse[PullRequestDiffPage]
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Data)
+	assert.Equal(t, gogs.MergeStateDiverged, output.Data.MergeState)
+	assert.Empty(t, output.Meta.Warnings)
+}
+
+func TestGetPullRequestDiffWarnsAboutConflictAndEmptyFilter(t *testing.T) {
+	client := &fakeClient{
+		pullDiff: gogs.PullRequestDiff{
+			Number:             1,
+			BaseRef:            "main",
+			MergeBase:          "8bb8836",
+			Diff:               "",
+			Files:              nil,
+			MergeState:         gogs.MergeStateConflicting,
+			MergeConflictPaths: []string{"ops/ops.go", "main.go"},
+		},
+	}
+	session := connectTestClient(t, client)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "get_pull_request_diff",
+		Arguments: map[string]any{
+			"owner": "owner", "repo": "calculator", "number": 1, "paths": []string{"absent/"},
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+
+	var output ToolResponse[PullRequestDiffPage]
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Data)
+	assert.Equal(t, gogs.MergeStateConflicting, output.Data.MergeState)
+	assert.Equal(t, []string{"ops/ops.go", "main.go"}, output.Data.MergeConflictPaths)
+	require.Len(t, output.Meta.Warnings, 2)
+	assert.Contains(t, output.Meta.Warnings[0], "merge may conflict")
+	assert.Contains(t, output.Meta.Warnings[0], "`ops/ops.go`")
+	assert.Contains(t, output.Meta.Warnings[0], "heuristic")
+	assert.Contains(t, output.Meta.Warnings[1], "No changes matched the requested paths")
+}

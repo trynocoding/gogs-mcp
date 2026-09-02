@@ -33,7 +33,7 @@ type Client interface {
 	ListIssueComments(context.Context, string, string, int64, string) ([]gogs.IssueComment, error)
 	ListPullRequests(context.Context, string, string, string, int) ([]gogs.PullRequestSummary, int, error)
 	GetPullRequest(context.Context, string, string, int64) (gogs.PullRequest, error)
-	GetPullRequestDiff(context.Context, string, string, int64, string, int) (gogs.PullRequestDiff, error)
+	GetPullRequestDiff(context.Context, string, string, int64, string, []string, int) (gogs.PullRequestDiff, error)
 	ListRepositoryLabels(context.Context, string, string) ([]gogs.RepositoryLabel, error)
 	ListRepositoryMilestones(context.Context, string, string) ([]gogs.RepositoryMilestone, error)
 	UserExists(context.Context, string) (bool, error)
