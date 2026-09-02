@@ -7,33 +7,63 @@ import (
 	"sync"
 )
 
-type redactingWriter struct {
-	mu      sync.Mutex
-	writer  io.Writer
-	secrets []string
+// Writer serializes log lines from many emitters so that JSON records never
+// interleave. It is safe for concurrent use and is shared by every user of
+// the process.
+type Writer struct {
+	mu     sync.Mutex
+	writer io.Writer
 }
 
-func (w *redactingWriter) Write(data []byte) (int, error) {
+func NewWriter(writer io.Writer) *Writer {
+	return &Writer{writer: writer}
+}
+
+func (w *Writer) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writer.Write(data)
+}
+
+// redactor removes a fixed set of secrets from every line before handing it
+// to the shared destination. Each user owns one redactor with only their own
+// secrets, so the cost of a log line does not grow with the number of users.
+type redactor struct {
+	destination *Writer
+	secrets     []string
+}
+
+func NewRedactor(destination *Writer, secrets ...string) io.Writer {
+	return &redactor{destination: destination, secrets: secrets}
+}
+
+func (r *redactor) Write(data []byte) (int, error) {
 	redacted := string(data)
-	for _, secret := range w.secrets {
+	for _, secret := range r.secrets {
 		if secret != "" {
 			redacted = strings.ReplaceAll(redacted, secret, "[REDACTED]")
 		}
 	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if _, err := io.WriteString(w.writer, redacted); err != nil {
-		return 0, err
-	}
-	return len(data), nil
+	return r.destination.Write([]byte(redacted))
 }
 
-func New(writer io.Writer, level string, secrets ...string) *slog.Logger {
+// NewLogger returns a logger without secret redaction. It must never receive
+// credential material.
+func NewLogger(destination *Writer, level string) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(destination, &slog.HandlerOptions{Level: parseLevel(level)}))
+}
+
+func NewRedactingLogger(destination *Writer, level string, secrets ...string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(
-		&redactingWriter{writer: writer, secrets: secrets},
+		NewRedactor(destination, secrets...),
 		&slog.HandlerOptions{Level: parseLevel(level)},
 	))
+}
+
+// New builds a redacting logger over any writer. It stays for the stdio
+// deployment, which has exactly one user.
+func New(writer io.Writer, level string, secrets ...string) *slog.Logger {
+	return NewRedactingLogger(NewWriter(writer), level, secrets...)
 }
 
 func parseLevel(level string) slog.Level {

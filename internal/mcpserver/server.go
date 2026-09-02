@@ -43,24 +43,47 @@ type Client interface {
 }
 
 type Server struct {
-	mcp *mcp.Server
+	mcp         *mcp.Server
+	schemaCache *mcp.SchemaCache
 }
 
 type emptyInput struct{}
 
 var fallbackRequestID atomic.Uint64
 
+// serverOptions carries the optional construction settings of a server.
+type serverOptions struct {
+	schemaCache *mcp.SchemaCache
+}
+
+// Option customizes one optional construction setting of a server.
+type Option func(*serverOptions)
+
+// WithSchemaCache shares one schema cache across several servers. The http
+// transport builds one server per authenticated user, and the cache removes
+// the repeated JSON schema resolution of every tool registration.
+func WithSchemaCache(cache *mcp.SchemaCache) Option {
+	return func(options *serverOptions) {
+		options.schemaCache = cache
+	}
+}
+
 // New assembles the MCP server. The snapshot manager enables search_code and
 // may be nil, in which case search_code reports that search is unavailable.
 // The search defaults bound the per-search timeout and file size. Write tools
 // are only registered when writeEnabled is set.
-func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search SearchDefaults, writeEnabled bool) *Server {
+func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search SearchDefaults, writeEnabled bool, options ...Option) *Server {
+	resolved := serverOptions{}
+	for _, option := range options {
+		option(&resolved)
+	}
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "gogs-mcp", Version: version.Version},
 		&mcp.ServerOptions{
 			Capabilities: &mcp.ServerCapabilities{},
 			Instructions: "Use the available tools to read data from the configured Gogs instance.",
 			Logger:       logger,
+			SchemaCache:  resolved.schemaCache,
 		},
 	)
 
@@ -110,7 +133,10 @@ func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search
 	registerSearchTools(server, client, snapshots, &identityCache{}, search)
 	registerIssueTools(server, client, writeEnabled)
 
-	return &Server{mcp: server}
+	return &Server{
+		mcp:         server,
+		schemaCache: resolved.schemaCache,
+	}
 }
 
 func (s *Server) MCP() *mcp.Server {

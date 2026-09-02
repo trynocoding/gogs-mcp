@@ -1,0 +1,11 @@
+{
+  "base_url": "https://gogs.internal.example/",
+  "transport": "http",
+  "http_addr": "127.0.0.1:8080",
+  "http_endpoint": "/mcp",
+  "http_token_header": "Authorization",
+  "http_user_cache_ttl": "5m",
+  "http_max_users": 128,
+  "cache_dir": "/var/cache/gogs-mcp",
+  "write_enabled": false
+}

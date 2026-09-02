@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path"
@@ -26,6 +27,21 @@ const (
 	maxSearchTimeout = 5 * time.Minute
 	maxConfigBytes   = 1 << 20
 	maxTokenBytes    = 8 << 10
+
+	defaultHTTPEndpoint     = "/mcp"
+	defaultHTTPTokenHeader  = "Authorization"
+	defaultHTTPUserCacheTTL = 5 * time.Minute
+	defaultHTTPMaxUsers     = 128
+	maxHTTPUserCacheTTL     = time.Hour
+	maxHTTPMaxUsers         = 1024
+)
+
+// Transport selects how the MCP server talks to its client.
+type Transport string
+
+const (
+	TransportStdio Transport = "stdio"
+	TransportHTTP  Transport = "http"
 )
 
 type Config struct {
@@ -47,6 +63,25 @@ type Config struct {
 	SearchTimeout time.Duration
 	// MaxFileBytes skips files larger than this during code search.
 	MaxFileBytes int64
+	// Transport selects between the stdio and http MCP transports.
+	Transport Transport
+	// HTTPAddr is the listen address of the http transport, for example
+	// "127.0.0.1:8080". It is required for the http transport.
+	HTTPAddr string
+	// HTTPEndpoint is the exact request path served by the http transport.
+	HTTPEndpoint string
+	// HTTPTokenHeader names the request header that carries the Gogs
+	// personal access token of each caller.
+	HTTPTokenHeader string
+	// HTTPUserCacheTTL bounds how long an authenticated Gogs user stays
+	// resolved between requests of the http transport.
+	HTTPUserCacheTTL time.Duration
+	// HTTPMaxUsers bounds how many Gogs users the http transport keeps
+	// resolved at the same time.
+	HTTPMaxUsers int
+	// HTTPJSONResponse answers http transport requests with plain JSON
+	// instead of an event stream.
+	HTTPJSONResponse bool
 }
 
 type fileConfig struct {
@@ -62,18 +97,40 @@ type fileConfig struct {
 	SearchTimeout     string `json:"search_timeout"`
 	MaxFileBytes      int64  `json:"max_file_bytes"`
 	LogLevel          string `json:"log_level"`
+	Transport         string `json:"transport"`
+	HTTPAddr          string `json:"http_addr"`
+	HTTPEndpoint      string `json:"http_endpoint"`
+	HTTPTokenHeader   string `json:"http_token_header"`
+	HTTPUserCacheTTL  string `json:"http_user_cache_ttl"`
+	HTTPMaxUsers      int    `json:"http_max_users"`
+	HTTPJSONResponse  *bool  `json:"http_json_response"`
 }
 
 type LookupEnv func(string) (string, bool)
 
 func Load(configPath string, lookup LookupEnv) (Config, error) {
+	return load(configPath, lookup, true)
+}
+
+// LoadForMaintenance loads the configuration for cache maintenance commands,
+// which may run without credentials when a user ID is given on the command
+// line. Every other validation still applies.
+func LoadForMaintenance(configPath string, lookup LookupEnv) (Config, error) {
+	return load(configPath, lookup, false)
+}
+
+func load(configPath string, lookup LookupEnv, requireStdioToken bool) (Config, error) {
 	cfg := Config{
-		HTTPTimeout:   defaultHTTPTimeout,
-		LogLevel:      "info",
-		CacheMaxBytes: defaultCacheMaxBytes,
-		CacheTTL:      defaultCacheTTL,
-		SearchTimeout: defaultSearchTimeout,
-		MaxFileBytes:  defaultMaxFileBytes,
+		HTTPTimeout:      defaultHTTPTimeout,
+		LogLevel:         "info",
+		CacheMaxBytes:    defaultCacheMaxBytes,
+		CacheTTL:         defaultCacheTTL,
+		SearchTimeout:    defaultSearchTimeout,
+		MaxFileBytes:     defaultMaxFileBytes,
+		HTTPEndpoint:     defaultHTTPEndpoint,
+		HTTPTokenHeader:  defaultHTTPTokenHeader,
+		HTTPUserCacheTTL: defaultHTTPUserCacheTTL,
+		HTTPMaxUsers:     defaultHTTPMaxUsers,
 	}
 	if lookup == nil {
 		lookup = os.LookupEnv
@@ -91,7 +148,7 @@ func Load(configPath string, lookup LookupEnv) (Config, error) {
 	if err := applyEnvironment(&cfg, lookup); err != nil {
 		return Config{}, err
 	}
-	if err := validate(&cfg); err != nil {
+	if err := validate(&cfg, requireStdioToken); err != nil {
 		return Config{}, err
 	}
 
@@ -201,6 +258,31 @@ func applyFile(cfg *Config, values fileConfig) error {
 	if values.MaxFileBytes != 0 {
 		cfg.MaxFileBytes = values.MaxFileBytes
 	}
+	if values.Transport != "" {
+		cfg.Transport = Transport(values.Transport)
+	}
+	if values.HTTPAddr != "" {
+		cfg.HTTPAddr = values.HTTPAddr
+	}
+	if values.HTTPEndpoint != "" {
+		cfg.HTTPEndpoint = values.HTTPEndpoint
+	}
+	if values.HTTPTokenHeader != "" {
+		cfg.HTTPTokenHeader = values.HTTPTokenHeader
+	}
+	if values.HTTPUserCacheTTL != "" {
+		ttl, err := time.ParseDuration(values.HTTPUserCacheTTL)
+		if err != nil {
+			return errors.Wrap(err, "parse http_user_cache_ttl")
+		}
+		cfg.HTTPUserCacheTTL = ttl
+	}
+	if values.HTTPMaxUsers != 0 {
+		cfg.HTTPMaxUsers = values.HTTPMaxUsers
+	}
+	if values.HTTPJSONResponse != nil {
+		cfg.HTTPJSONResponse = *values.HTTPJSONResponse
+	}
 	return nil
 }
 
@@ -279,6 +361,35 @@ func applyEnvironment(cfg *Config, lookup LookupEnv) error {
 		}
 		cfg.MaxFileBytes = bytes
 	}
+	if value, ok := lookup("GOGS_MCP_TRANSPORT"); ok {
+		cfg.Transport = Transport(value)
+	}
+	if value, ok := lookup("GOGS_MCP_HTTP_ADDR"); ok {
+		cfg.HTTPAddr = value
+	}
+	if value, ok := lookup("GOGS_MCP_HTTP_ENDPOINT"); ok {
+		cfg.HTTPEndpoint = value
+	}
+	if value, ok := lookup("GOGS_MCP_HTTP_TOKEN_HEADER"); ok {
+		cfg.HTTPTokenHeader = value
+	}
+	if value, ok := lookup("GOGS_MCP_HTTP_USER_CACHE_TTL"); ok {
+		ttl, err := time.ParseDuration(value)
+		if err != nil {
+			return errors.Wrap(err, "parse GOGS_MCP_HTTP_USER_CACHE_TTL")
+		}
+		cfg.HTTPUserCacheTTL = ttl
+	}
+	if value, ok := lookup("GOGS_MCP_HTTP_MAX_USERS"); ok {
+		users, err := strconv.Atoi(value)
+		if err != nil {
+			return errors.Wrap(err, "parse GOGS_MCP_HTTP_MAX_USERS")
+		}
+		cfg.HTTPMaxUsers = users
+	}
+	if err := applyBoolEnv(&cfg.HTTPJSONResponse, "GOGS_MCP_HTTP_JSON_RESPONSE", lookup); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -295,7 +406,7 @@ func applyBoolEnv(destination *bool, name string, lookup LookupEnv) error {
 	return nil
 }
 
-func validate(cfg *Config) error {
+func validate(cfg *Config, requireStdioToken bool) error {
 	if cfg.BaseURL == nil {
 		return errors.New("GOGS_BASE_URL is required")
 	}
@@ -311,11 +422,29 @@ func validate(cfg *Config) error {
 	if cfg.BaseURL.Scheme == "http" && !cfg.AllowInsecureHTTP {
 		return errors.New("plain HTTP requires GOGS_ALLOW_INSECURE_HTTP=true")
 	}
+	switch cfg.Transport {
+	case "", TransportStdio:
+		cfg.Transport = TransportStdio
+	case TransportHTTP:
+		if cfg.HTTPAddr == "" {
+			return errors.New("GOGS_MCP_HTTP_ADDR is required for the http transport")
+		}
+		if _, _, err := net.SplitHostPort(cfg.HTTPAddr); err != nil {
+			return errors.Wrap(err, "parse GOGS_MCP_HTTP_ADDR")
+		}
+	default:
+		return errors.Newf("GOGS_MCP_TRANSPORT %q is invalid; use stdio or http", string(cfg.Transport))
+	}
 	if cfg.Token != "" && cfg.TokenFile != "" {
 		return errors.New("GOGS_TOKEN and GOGS_TOKEN_FILE are mutually exclusive")
 	}
 	if cfg.Token == "" && cfg.TokenFile == "" {
-		return errors.New("exactly one of GOGS_TOKEN or GOGS_TOKEN_FILE is required")
+		if cfg.Transport == TransportStdio && requireStdioToken {
+			return errors.New("exactly one of GOGS_TOKEN or GOGS_TOKEN_FILE is required")
+		}
+		// The http transport authenticates every request with a header
+		// credential instead; a configured token is still allowed here so
+		// that verify and cache clean can run against the same deployment.
 	}
 	if cfg.TokenFile != "" {
 		token, err := readTokenFile(cfg.TokenFile)
@@ -324,7 +453,7 @@ func validate(cfg *Config) error {
 		}
 		cfg.Token = token
 	}
-	if strings.TrimSpace(cfg.Token) == "" {
+	if cfg.Transport == TransportStdio && requireStdioToken && strings.TrimSpace(cfg.Token) == "" {
 		return errors.New("Gogs token must not be empty")
 	}
 	if strings.ContainsAny(cfg.Token, "\r\n") {
@@ -365,7 +494,64 @@ func validate(cfg *Config) error {
 	if cfg.MaxFileBytes <= 0 {
 		return errors.New("GOGS_MCP_MAX_FILE_BYTES must be greater than zero")
 	}
+	if err := validateHTTPSettings(cfg); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateHTTPSettings applies the http transport rules to whichever values
+// are configured. The rules run for every transport so that a mistyped http
+// setting never hides behind an unused transport.
+func validateHTTPSettings(cfg *Config) error {
+	if !strings.HasPrefix(cfg.HTTPEndpoint, "/") || cfg.HTTPEndpoint == "/" || path.Clean(cfg.HTTPEndpoint) != cfg.HTTPEndpoint {
+		return errors.Newf("GOGS_MCP_HTTP_ENDPOINT %q must be one absolute request path", cfg.HTTPEndpoint)
+	}
+	if !isValidHeaderName(cfg.HTTPTokenHeader) || reservedHeader(cfg.HTTPTokenHeader) {
+		return errors.Newf("GOGS_MCP_HTTP_TOKEN_HEADER %q is not usable as a credential header", cfg.HTTPTokenHeader)
+	}
+	if cfg.HTTPUserCacheTTL <= 0 || cfg.HTTPUserCacheTTL > maxHTTPUserCacheTTL {
+		return errors.Newf("GOGS_MCP_HTTP_USER_CACHE_TTL must be between just above zero and %s", maxHTTPUserCacheTTL)
+	}
+	if cfg.HTTPMaxUsers <= 0 || cfg.HTTPMaxUsers > maxHTTPMaxUsers {
+		return errors.Newf("GOGS_MCP_HTTP_MAX_USERS must be between 1 and %d", maxHTTPMaxUsers)
+	}
+	return nil
+}
+
+// isValidHeaderName reports whether the name is a valid RFC 7230 header
+// field name, so the credential header survives every HTTP client and proxy.
+func isValidHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, character := range name {
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", character):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// reservedHeader lists headers whose meaning is owned by HTTP or the MCP
+// streamable transport, which a credential header must never shadow.
+func reservedHeader(name string) bool {
+	reserved := []string{
+		"Host", "Content-Length", "Content-Type", "Transfer-Encoding",
+		"Accept", "Cookie", "Expect", "Connection",
+		"Mcp-Session-Id", "Mcp-Protocol-Version", "Last-Event-Id",
+	}
+	for _, candidate := range reserved {
+		if strings.EqualFold(name, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func readTokenFile(tokenPath string) (string, error) {

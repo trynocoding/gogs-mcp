@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-Gogs MCP 是一个本地 stdio MCP 服务器，对接 Gogs v0.14.2。默认只读：查看当前登录用户、浏览有权访问的仓库及其内容、读取 issue、审查 pull request。写 issue 的工具要显式设置 `GOGS_MCP_WRITE_ENABLED` 才注册。
+Gogs MCP 是一个对接 Gogs v0.14.2 的 MCP 服务器，可以通过 stdio 服务单用户，也可以通过 Streamable HTTP 集中部署给多人。默认只读：查看当前登录用户、浏览有权访问的仓库及其内容、读取 issue、审查 pull request。写 issue 的工具要显式设置 `GOGS_MCP_WRITE_ENABLED` 才注册。
 
 | 工具 | 用途 |
 |---|---|
@@ -67,9 +67,10 @@ task test:e2e:git
 task test:e2e:search
 task test:e2e:issues
 task test:e2e:protocol
+task test:e2e:http
 ```
 
-`task test:e2e` 一条命令跑完所有场景：仓库发现、源码浏览、代码搜索、issue 创建与维护、旧版 MCP initialize 握手，以及认证和权限失败路径。每个会话结束后会扫描日志，确认 token、私有源码和 issue 正文没有泄漏。
+`task test:e2e` 一条命令跑完所有场景：仓库发现、源码浏览、代码搜索、issue 创建与维护、旧版 MCP initialize 握手、Streamable HTTP 传输下的双用户隔离，以及认证和权限失败路径。每个会话结束后会扫描日志，确认 token、私有源码和 issue 正文没有泄漏。
 
 Gogs checkout 不在默认位置时，用 `GOGS_E2E_SOURCE_DIR` 指定路径。仓库 E2E 场景会创建一个所有者、一个只读协作者、一个外人，以及几座互相隔离的私有仓库，验证的是 Gogs 真实的可见性和权限行为。每次运行都随机分配主机端口、容器网络、镜像名和临时数据目录，跑完（不管成败）全部清理。
 
@@ -83,7 +84,7 @@ Gogs checkout 不在默认位置时，用 `GOGS_E2E_SOURCE_DIR` 指定路径。�
 
 所有结果边界都可观察：默认最多返回 50 个匹配（`max_results` 可以调到 500），每个匹配带文件路径、从 1 起算的行号和字节列号、匹配行，以及前后各两行上下文（`context_lines`，0 到 10）。命中 `max_results`、64 KiB 输出上限或搜索时限（`timeout_seconds`，1 到 300）任何一个，`meta.truncated` 都会置位并附警告。超时但已有部分结果时照常返回；一无所获的超时返回 `SEARCH_TIMEOUT`。`include` 和 `exclude` 的 glob 过滤路径，`.git` 始终排除。二进制文件（含 NUL 字节或无效 UTF-8）和超过 1 MiB 的文件（上限 `GOGS_MCP_MAX_FILE_BYTES`）会跳过，并在警告里说明。重复搜索同一个 commit 时，结果带 `meta.cache_hit`，不会再请求 Gogs。
 
-快照缓存有上限：24 小时（`GOGS_MCP_CACHE_TTL`）没被用到的快照过期；每个用户的缓存超过 2 GiB（`GOGS_MCP_CACHE_MAX_BYTES`）时，先淘汰最近最少使用的快照，再开始新下载。正在被搜索使用的快照不会被淘汰；实在腾不出空间，这次搜索就以 `CACHE_CAPACITY_EXCEEDED` 失败，而不是继续下载。`gogs-mcp cache clean` 清掉当前用户的快照缓存和 pull request diff 缓存，`gogs-mcp cache clean --all` 清掉所有已验证的缓存根；配置、令牌和缓存根之外的任何东西都不会动。
+快照缓存有上限：24 小时（`GOGS_MCP_CACHE_TTL`）没被用到的快照过期；每个用户的缓存超过 2 GiB（`GOGS_MCP_CACHE_MAX_BYTES`）时，先淘汰最近最少使用的快照，再开始新下载。正在被搜索使用的快照不会被淘汰；实在腾不出空间，这次搜索就以 `CACHE_CAPACITY_EXCEEDED` 失败，而不是继续下载。`gogs-mcp cache clean` 清掉当前用户的快照缓存和 pull request diff 缓存，`gogs-mcp cache clean --user <数字ID>` 不用凭据清掉指定用户的缓存，`gogs-mcp cache clean --all` 清掉所有缓存根；配置、令牌和缓存根之外的任何东西都不会动。
 
 Gogs 的 issue 只用于仓库内部讨论；需求仍以 Jira 为准，本服务器不与 Jira 同步。`list_issues` 只接受 `open` 和 `closed` 两个状态值——Gogs v0.14.2 会把其他值一律当成 open；page size 也不让传，服务端写死了。有没有下一页看 Gogs 的 `Link` 响应头，有的话通过 `meta.next_page` 告诉你。`list_issues` 返回紧凑摘要，不带正文；`get_issue` 返回完整记录，含正文、创建者、指派人、标签、里程碑、评论数和时间戳。找不到时统一返回同一个 not-found 错误码，不区分是仓库不存在还是 issue 不存在。`list_issue_comments` 先验证 `since` 是不是合法的 RFC3339 时间戳，再去请求 Gogs；结果受 `max_comments`（默认 100，最多 500）和 64 KiB 输出上限约束，碰到任一上限就置位 `meta.truncated` 并附警告。
 
@@ -140,6 +141,30 @@ claude mcp add gogs \
 
 用 `claude mcp get gogs` 或 Claude Code 里的 `/mcp` 检查连接状态。`serve` 的 stdout 只跑 MCP 协议消息，JSON 日志全部走 stderr。
 
+## 以 Streamable HTTP 提供服务
+
+集中部署用一个进程服务所有用户。每个 MCP 客户端在请求头里带上自己的 Gogs 个人访问令牌，服务器按令牌解析出隔离的用户级工具服务器——各有各的 Gogs 客户端和缓存目录——无效令牌收到 `401`。服务器自身不持有任何凭据。
+
+```bash
+GOGS_BASE_URL=https://gogs.internal.example/ \
+GOGS_MCP_TRANSPORT=http \
+GOGS_MCP_HTTP_ADDR=127.0.0.1:8080 \
+.bin/gogs-mcp serve
+```
+
+把端点注册进 Claude Code：
+
+```bash
+claude mcp add gogs \
+  --transport http \
+  --header "Authorization: token $GOGS_PAT" \
+  https://mcp.internal.example/mcp
+```
+
+传输是无状态的：每个请求相互独立，任何负载均衡器都可以分发流量。`GET /healthz` 无需凭据返回 `200`，供探活使用。TLS 交给反向代理终结；服务器本身只说明文 HTTP，监听非环回地址时会输出警告。离线包里的 `docs/http-deployment.md` 提供反向代理配置片段、安全清单和容量估算。
+
+没有配置令牌的部署无法运行 `verify` 和基于令牌的 `cache clean`；可以只为那一条命令设置 `GOGS_TOKEN`，也可以用无需凭据的 `cache clean --user <数字ID>` 和 `cache clean --all`。被撤销的令牌最长还能用到用户缓存过期为止（默认 5 分钟，上限 1 小时）；之后工具调用以 `AUTHENTICATION_FAILED` 失败。每用户的磁盘占用受与 stdio 相同的缓存上限约束，总量随活跃用户数增长，`cache clean --all` 可以全部回收。
+
 ## 配置
 
 可选的 JSON 文件存放非敏感设置：
@@ -153,10 +178,17 @@ claude mcp add gogs \
 | 环境变量 | 默认值 | 描述 |
 |---|---|---|
 | `GOGS_BASE_URL` | 无。 | 必填，Gogs 的基础 URL，已有子路径会保留。 |
-| `GOGS_TOKEN` | 无。 | 直接传入的个人访问令牌。 |
+| `GOGS_TOKEN` | 无。 | 直接传入的个人访问令牌。stdio 必填；HTTP 传输下只有 `verify` 和 `cache clean` 需要。 |
 | `GOGS_TOKEN_FILE` | 无。 | 私有令牌文件的路径。 |
 | `GOGS_CA_FILE` | 系统信任库。 | 额外的 PEM CA 证书文件。 |
 | `GOGS_ALLOW_INSECURE_HTTP` | `false`。 | 显式允许纯 HTTP。 |
+| `GOGS_MCP_TRANSPORT` | `stdio`。 | `stdio` 服务单个本地用户，`http` 走 Streamable HTTP。 |
+| `GOGS_MCP_HTTP_ADDR` | 无。 | 监听地址 `host:port`；`http` 传输必填。 |
+| `GOGS_MCP_HTTP_ENDPOINT` | `/mcp`。 | MCP 处理器的绝对端点路径。 |
+| `GOGS_MCP_HTTP_TOKEN_HEADER` | `Authorization`。 | 携带调用方凭据的请求头；接受 `Bearer` 和 `token` 两种 scheme。 |
+| `GOGS_MCP_HTTP_USER_CACHE_TTL` | `5m`。 | 已解析用户的缓存时长，至多 `1h`。 |
+| `GOGS_MCP_HTTP_MAX_USERS` | `128`。 | 缓存的已解析用户数上限，超过后按最近最少使用淘汰，至多 `1024`。 |
+| `GOGS_MCP_HTTP_JSON_RESPONSE` | `false`。 | POST 用纯 JSON 响应，不用 SSE 流。 |
 | `GOGS_MCP_CACHE_DIR` | OS 用户缓存目录。 | `search_code` 快照与 pull request diff 缓存根的绝对路径。 |
 | `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`。 | 每个用户缓存的容量上限，超过后按最近最少使用淘汰；覆盖 search 快照和 pull request diff。 |
 | `GOGS_MCP_CACHE_TTL` | `24h`。 | 快照或 pull request 缓存条目多久没被使用就过期。 |
@@ -173,7 +205,7 @@ claude mcp add gogs \
 ```text
 gogs-mcp serve [--config PATH]
 gogs-mcp verify [--config PATH]
-gogs-mcp cache clean [--config PATH] [--all]
+gogs-mcp cache clean [--config PATH] [--user ID | --all]
 gogs-mcp version [--json]
 ```
 

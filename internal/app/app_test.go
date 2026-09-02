@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -124,25 +125,7 @@ func TestServeOverStdioWithOfficialClient(t *testing.T) {
 	for index, tool := range tools.Tools {
 		names[index] = tool.Name
 	}
-	assert.ElementsMatch(t, []string{
-		"get_authenticated_user",
-		"list_repositories",
-		"search_repositories",
-		"get_repository",
-		"list_directory",
-		"get_file",
-		"list_branches",
-		"get_branch",
-		"list_commits",
-		"get_commit",
-		"search_code",
-		"list_issues",
-		"get_issue",
-		"list_issue_comments",
-		"list_pull_requests",
-		"get_pull_request",
-		"get_pull_request_diff",
-	}, names)
+	assert.ElementsMatch(t, readOnlyToolNames(), names)
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      "get_authenticated_user",
@@ -210,6 +193,30 @@ func TestServeHelperProcess(t *testing.T) {
 	}
 	exitCode := Run(context.Background(), []string{"serve"}, os.Stdin, os.Stdout, os.Stderr, os.LookupEnv)
 	os.Exit(exitCode)
+}
+
+// readOnlyToolNames lists the tools every deployment registers, regardless
+// of the transport or the write toggle.
+func readOnlyToolNames() []string {
+	return []string{
+		"get_authenticated_user",
+		"list_repositories",
+		"search_repositories",
+		"get_repository",
+		"list_directory",
+		"get_file",
+		"list_branches",
+		"get_branch",
+		"list_commits",
+		"get_commit",
+		"search_code",
+		"list_issues",
+		"get_issue",
+		"list_issue_comments",
+		"list_pull_requests",
+		"get_pull_request",
+		"get_pull_request_diff",
+	}
 }
 
 func filteredEnvironment(source []string) []string {
@@ -305,6 +312,8 @@ func TestCacheCleanAllRemovesVerifiedRootsOnly(t *testing.T) {
 	seedSnapshotCache(t, cacheRoot, "https://gogs.example.test/", 21)
 	require.NoError(t, os.WriteFile(filepath.Join(cacheRoot, "keep.txt"), []byte("keep"), 0o600))
 	require.NoError(t, os.MkdirAll(filepath.Join(cacheRoot, "tmp"), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheRoot, "pull"), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheRoot, "users", "22", "pull"), 0o700))
 	instance := instanceRoot(t, cacheRoot)
 
 	var stdout bytes.Buffer
@@ -321,7 +330,11 @@ func TestCacheCleanAllRemovesVerifiedRootsOnly(t *testing.T) {
 	_, err = os.Stat(filepath.Join(cacheRoot, "keep.txt"))
 	require.NoError(t, err, "unrelated files must survive")
 	_, err = os.Stat(filepath.Join(cacheRoot, "tmp"))
-	assert.NoError(t, err, "the temporary area is not an instance root")
+	require.NoError(t, err, "the temporary area is not an instance root")
+	_, err = os.Stat(filepath.Join(cacheRoot, "pull"))
+	assert.True(t, os.IsNotExist(err), "the single-user pull cache must be removed")
+	_, err = os.Stat(filepath.Join(cacheRoot, "users"))
+	assert.True(t, os.IsNotExist(err), "the per-user pull caches must be removed")
 }
 
 func TestCacheCleanRejectsBadInvocation(t *testing.T) {
@@ -334,6 +347,7 @@ func TestCacheCleanRejectsBadInvocation(t *testing.T) {
 		{"cache"},
 		{"cache", "scrub"},
 		{"cache", "clean", "extra"},
+		{"cache", "clean", "--all", "--user", "21"},
 	} {
 		exitCode := Run(context.Background(), args, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}, environment)
 		assert.Equal(t, exitConfig, exitCode, "%v", args)
@@ -444,4 +458,249 @@ func TestServeOverStdioRegistersWriteToolsWhenEnabled(t *testing.T) {
 
 	require.NoError(t, session.Close())
 	assert.NotContains(t, stderr.String(), token)
+}
+
+const (
+	aliceHTTPToken = "http-alice-token"
+	bobHTTPToken   = "http-bob-token"
+)
+
+// multiUserGogs answers /api/v1/user from the bearer token, so two MCP
+// sessions with different tokens must observe different users.
+func multiUserGogs(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/v1/user" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.Header.Get("Authorization") {
+		case "token " + aliceHTTPToken:
+			_, _ = writer.Write([]byte(`{"id":1,"username":"alice","full_name":"Alice","email":"alice@example.test"}`))
+		case "token " + bobHTTPToken:
+			_, _ = writer.Write([]byte(`{"id":2,"username":"bob","full_name":"Bob","email":"bob@example.test"}`))
+		default:
+			writer.WriteHeader(http.StatusUnauthorized)
+			_, _ = writer.Write([]byte(`{"message":"token is required"}`))
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// headerTransport adds one Gogs credential header to every request.
+type headerTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (t *headerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	cloned := request.Clone(request.Context())
+	if t.token != "" {
+		cloned.Header.Set("Authorization", "token "+t.token)
+	}
+	return t.base.RoundTrip(cloned)
+}
+
+// callHTTPUserTool invokes get_authenticated_user and returns its data object.
+func callHTTPUserTool(t *testing.T, ctx context.Context, session *mcp.ClientSession) map[string]any {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_authenticated_user", Arguments: map[string]any{}})
+	require.NoError(t, err)
+	require.False(t, result.IsError, "the tool call must succeed")
+	content, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok, "structured content must be an object")
+	data, ok := content["data"].(map[string]any)
+	require.True(t, ok, "structured content must carry data")
+	return data
+}
+
+// runHelper starts the helper process and fails the test when it does not
+// exit within the timeout. It returns the process exit code.
+func runHelper(t *testing.T, command *exec.Cmd) int {
+	t.Helper()
+	require.NoError(t, command.Start())
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	})
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the helper process did not exit within the timeout")
+	}
+	return command.ProcessState.ExitCode()
+}
+
+func TestServeOverHTTPWithOfficialClient(t *testing.T) {
+	server := multiUserGogs(t)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := listener.Addr().String()
+	require.NoError(t, listener.Close())
+
+	command := exec.Command(os.Args[0], "-test.run=^TestServeHelperProcess$")
+	command.Env = append(filteredEnvironment(os.Environ()),
+		"GOGS_MCP_HELPER_PROCESS=1",
+		"GOGS_BASE_URL="+server.URL,
+		"GOGS_ALLOW_INSECURE_HTTP=true",
+		"GOGS_MCP_TRANSPORT=http",
+		"GOGS_MCP_HTTP_ADDR="+addr,
+		"GOGS_MCP_CACHE_DIR="+t.TempDir(),
+	)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	})
+	require.NoError(t, command.Start())
+
+	require.Eventually(t, func() bool {
+		response, err := http.Get("http://" + addr + "/healthz")
+		if err != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}, 10*time.Second, 20*time.Millisecond, "the HTTP transport must serve the health probe")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := mcp.NewClient(&mcp.Implementation{Name: "gogs-mcp-http-test", Version: "test"}, nil)
+	connect := func(token string) *mcp.ClientSession {
+		t.Helper()
+		transport := &mcp.StreamableClientTransport{
+			Endpoint: "http://" + addr + "/mcp",
+			HTTPClient: &http.Client{
+				Transport: &headerTransport{token: token, base: http.DefaultTransport},
+			},
+			DisableStandaloneSSE: true,
+		}
+		session, err := client.Connect(ctx, transport, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = session.Close() })
+		return session
+	}
+
+	alice := connect(aliceHTTPToken)
+	tools, err := alice.ListTools(ctx, nil)
+	require.NoError(t, err)
+	names := make([]string, len(tools.Tools))
+	for index, tool := range tools.Tools {
+		names[index] = tool.Name
+	}
+	assert.ElementsMatch(t, readOnlyToolNames(), names)
+
+	assert.Equal(t, "alice", callHTTPUserTool(t, ctx, alice)["username"])
+	assert.Equal(t, "bob", callHTTPUserTool(t, ctx, connect(bobHTTPToken))["username"])
+
+	response, err := http.Post("http://"+addr+"/mcp", "application/json", strings.NewReader(`{}`))
+	require.NoError(t, err)
+	defer func() { _ = response.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, response.StatusCode, "a request without a credential must be rejected")
+
+	_ = command.Process.Kill()
+	_ = command.Wait()
+	assert.NotContains(t, stderr.String(), aliceHTTPToken)
+	assert.NotContains(t, stderr.String(), bobHTTPToken)
+}
+
+func TestServeOverHTTPRejectsTokenConfiguration(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=^TestServeHelperProcess$")
+	command.Env = append(filteredEnvironment(os.Environ()),
+		"GOGS_MCP_HELPER_PROCESS=1",
+		"GOGS_BASE_URL=https://gogs.example.test/",
+		"GOGS_MCP_TRANSPORT=http",
+		"GOGS_MCP_HTTP_ADDR=127.0.0.1:0",
+		"GOGS_TOKEN=leftover-secret-token",
+	)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+
+	assert.Equal(t, exitConfig, runHelper(t, command))
+	assert.Contains(t, stderr.String(), "Configuration error")
+}
+
+func TestServeOverHTTPListenErrorExitsWithConfigCode(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+	occupied := listener.Addr().String()
+
+	command := exec.Command(os.Args[0], "-test.run=^TestServeHelperProcess$")
+	command.Env = append(filteredEnvironment(os.Environ()),
+		"GOGS_MCP_HELPER_PROCESS=1",
+		"GOGS_BASE_URL=https://gogs.example.test/",
+		"GOGS_MCP_TRANSPORT=http",
+		"GOGS_MCP_HTTP_ADDR="+occupied,
+	)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+
+	assert.Equal(t, exitConfig, runHelper(t, command))
+	assert.Contains(t, stderr.String(), "Configuration error")
+}
+
+func TestCacheCleanRemovesNamedUserCache(t *testing.T) {
+	cacheRoot := t.TempDir()
+	seedSnapshotCache(t, cacheRoot, "https://gogs.example.test/", 21, 22)
+	for _, id := range []string{"21", "22"} {
+		dir := filepath.Join(cacheRoot, "users", id, "pull")
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "objects"), []byte("pull"), 0o600))
+	}
+
+	var stdout bytes.Buffer
+	exitCode := Run(context.Background(), []string{"cache", "clean", "--user", "21"}, strings.NewReader(""), &stdout, &bytes.Buffer{}, mapEnvironment(map[string]string{
+		"GOGS_BASE_URL":      "https://gogs.example.test/",
+		"GOGS_MCP_CACHE_DIR": cacheRoot,
+	}))
+	assert.Equal(t, exitOK, exitCode)
+	assert.Contains(t, stdout.String(), "user ID 21")
+
+	_, err := os.Stat(filepath.Join(cacheRoot, "users", "21"))
+	assert.True(t, os.IsNotExist(err), "the named user's cache must be removed")
+	_, err = os.Stat(filepath.Join(cacheRoot, "users", "22"))
+	require.NoError(t, err, "other users' caches must survive")
+
+	instance := instanceRoot(t, cacheRoot)
+	remaining, err := os.ReadDir(instance)
+	require.NoError(t, err)
+	userDirs := make([]string, 0, len(remaining))
+	for _, entry := range remaining {
+		userDirs = append(userDirs, entry.Name())
+	}
+	assert.Equal(t, []string{"22"}, userDirs, "only the named user's snapshot cache is removed")
+}
+
+func TestCacheCleanWithoutCredentialsNeedsSelector(t *testing.T) {
+	var stderr bytes.Buffer
+	exitCode := Run(context.Background(), []string{"cache", "clean"}, strings.NewReader(""), &bytes.Buffer{}, &stderr, mapEnvironment(map[string]string{
+		"GOGS_BASE_URL":      "https://gogs.example.test/",
+		"GOGS_MCP_CACHE_DIR": t.TempDir(),
+	}))
+	assert.Equal(t, exitConfig, exitCode)
+	assert.Contains(t, stderr.String(), "--user")
+}
+
+func TestVerifyWithoutTokenGivesClearDiagnostic(t *testing.T) {
+	var stdout bytes.Buffer
+	exitCode := Run(context.Background(), []string{"verify"}, strings.NewReader(""), &stdout, &bytes.Buffer{}, mapEnvironment(map[string]string{
+		"GOGS_BASE_URL":      "https://gogs.example.test/",
+		"GOGS_MCP_TRANSPORT": "http",
+		"GOGS_MCP_HTTP_ADDR": "127.0.0.1:0",
+	}))
+	assert.Equal(t, exitConfig, exitCode)
+
+	var result diagnostic
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result))
+	assert.False(t, result.OK)
+	require.NotNil(t, result.Error)
+	assert.Equal(t, "CONFIG_INVALID", result.Error.Code)
+	assert.Contains(t, result.Error.Message, "Gogs token")
 }

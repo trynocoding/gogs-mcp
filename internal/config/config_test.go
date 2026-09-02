@@ -197,3 +197,137 @@ func TestLoadRejectsSearchTimeoutAbovePerRequestCap(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must not exceed")
 }
+
+func TestHTTPTransportDefaults(t *testing.T) {
+	cfg, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL":      "https://gogs.example.test/",
+		"GOGS_MCP_TRANSPORT": "http",
+		"GOGS_MCP_HTTP_ADDR": "127.0.0.1:8080",
+	}))
+	require.NoError(t, err)
+
+	assert.Equal(t, TransportHTTP, cfg.Transport)
+	assert.Equal(t, "127.0.0.1:8080", cfg.HTTPAddr)
+	assert.Equal(t, "/mcp", cfg.HTTPEndpoint)
+	assert.Equal(t, "Authorization", cfg.HTTPTokenHeader)
+	assert.Equal(t, 5*time.Minute, cfg.HTTPUserCacheTTL)
+	assert.Equal(t, 128, cfg.HTTPMaxUsers)
+	assert.False(t, cfg.HTTPJSONResponse)
+}
+
+func TestHTTPTransportAllowsMissingToken(t *testing.T) {
+	cfg, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL":      "https://gogs.example.test/",
+		"GOGS_MCP_TRANSPORT": "http",
+		"GOGS_MCP_HTTP_ADDR": "[::1]:9090",
+	}))
+	require.NoError(t, err)
+	assert.Empty(t, cfg.Token)
+	assert.Empty(t, cfg.TokenFile)
+}
+
+func TestStdioTransportStillRequiresToken(t *testing.T) {
+	_, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL": "https://gogs.example.test/",
+	}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GOGS_TOKEN")
+
+	cfg, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL": "https://gogs.example.test/",
+		"GOGS_TOKEN":    "secret-token",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, TransportStdio, cfg.Transport)
+}
+
+func TestLoadRejectsInvalidTransportSettings(t *testing.T) {
+	testCases := []struct {
+		name    string
+		value   string
+		invalid string
+	}{
+		{"missing_addr", "http", "GOGS_MCP_HTTP_ADDR"},
+		{"bad_transport", "socket", "GOGS_MCP_TRANSPORT"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			values := map[string]string{
+				"GOGS_BASE_URL": "https://gogs.example.test/",
+			}
+			if testCase.value == "http" {
+				values["GOGS_MCP_TRANSPORT"] = "http"
+			} else {
+				values["GOGS_MCP_TRANSPORT"] = testCase.value
+			}
+			if testCase.name != "missing_addr" {
+				values["GOGS_MCP_HTTP_ADDR"] = "127.0.0.1:8080"
+			}
+			_, err := Load("", environment(values))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), testCase.invalid)
+		})
+	}
+}
+
+func TestLoadRejectsMalformedHTTPAddress(t *testing.T) {
+	_, err := Load("", environment(map[string]string{
+		"GOGS_BASE_URL":      "https://gogs.example.test/",
+		"GOGS_MCP_TRANSPORT": "http",
+		"GOGS_MCP_HTTP_ADDR": "127.0.0.1",
+	}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GOGS_MCP_HTTP_ADDR")
+}
+
+func TestLoadRejectsInvalidHTTPSettings(t *testing.T) {
+	testCases := map[string]struct{ name, value string }{
+		"endpoint_relative":      {"GOGS_MCP_HTTP_ENDPOINT", "mcp"},
+		"endpoint_root":          {"GOGS_MCP_HTTP_ENDPOINT", "/"},
+		"endpoint_traversal":     {"GOGS_MCP_HTTP_ENDPOINT", "/a/../mcp"},
+		"header_invalid_chars":   {"GOGS_MCP_HTTP_TOKEN_HEADER", "X Gogs Token"},
+		"header_reserved_host":   {"GOGS_MCP_HTTP_TOKEN_HEADER", "Host"},
+		"header_reserved_case":   {"GOGS_MCP_HTTP_TOKEN_HEADER", "mcp-session-id"},
+		"user_cache_ttl_zero":    {"GOGS_MCP_HTTP_USER_CACHE_TTL", "0s"},
+		"user_cache_ttl_too_big": {"GOGS_MCP_HTTP_USER_CACHE_TTL", "2h"},
+		"max_users_zero":         {"GOGS_MCP_HTTP_MAX_USERS", "0"},
+		"max_users_too_big":      {"GOGS_MCP_HTTP_MAX_USERS", "2000"},
+	}
+	for name, setting := range testCases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load("", environment(map[string]string{
+				"GOGS_BASE_URL": "https://gogs.example.test/",
+				"GOGS_TOKEN":    "secret-token",
+				setting.name:    setting.value,
+			}))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestHTTPTransportOverridesFromEnvironmentAndFile(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(configPath, []byte(`{
+		"base_url": "https://gogs.example.test",
+		"transport": "http",
+		"http_addr": "127.0.0.1:1",
+		"http_endpoint": "/gogs-mcp",
+		"http_token_header": "X-Gogs-Token",
+		"http_user_cache_ttl": "10m",
+		"http_max_users": 16,
+		"http_json_response": true
+	}`), 0o600))
+
+	cfg, err := Load(configPath, environment(map[string]string{
+		"GOGS_MCP_HTTP_ADDR": "0.0.0.0:2",
+	}))
+	require.NoError(t, err)
+
+	assert.Equal(t, TransportHTTP, cfg.Transport)
+	assert.Equal(t, "0.0.0.0:2", cfg.HTTPAddr)
+	assert.Equal(t, "/gogs-mcp", cfg.HTTPEndpoint)
+	assert.Equal(t, "X-Gogs-Token", cfg.HTTPTokenHeader)
+	assert.Equal(t, 10*time.Minute, cfg.HTTPUserCacheTTL)
+	assert.Equal(t, 16, cfg.HTTPMaxUsers)
+	assert.True(t, cfg.HTTPJSONResponse)
+}

@@ -3,6 +3,8 @@ package gogs
 import (
 	"context"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,4 +32,25 @@ func TestGitCloneURLStripsAPIRoot(t *testing.T) {
 		client := &Client{apiRoot: parsed}
 		assert.Equal(t, expected, client.gitCloneURL("owner", "calculator").String(), apiRoot)
 	}
+}
+
+func TestCleanPullCacheCleansDirectoryWithoutEngine(t *testing.T) {
+	cacheDir := t.TempDir()
+	pullDir := filepath.Join(cacheDir, "pull")
+	require.NoError(t, os.MkdirAll(filepath.Join(pullDir, "abcdef01.git"), 0o700))
+
+	client := &Client{cacheDir: cacheDir}
+	require.NoError(t, client.CleanPullCache())
+
+	_, err := os.Lstat(pullDir)
+	assert.True(t, os.IsNotExist(err), "the pull cache directory must be removed")
+}
+
+func TestCleanPullCacheIsNoOpWithoutCacheDirectory(t *testing.T) {
+	client := &Client{}
+	assert.NoError(t, client.CleanPullCache())
+}
+
+func TestCleanPullCacheDirRejectsEmptyDirectory(t *testing.T) {
+	assert.NoError(t, CleanPullCacheDir(""))
 }

@@ -9,9 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 
 	"gogs-mcp/internal/config"
 	"gogs-mcp/internal/gogs"
+	"gogs-mcp/internal/httpserver"
 	"gogs-mcp/internal/mcpserver"
 	"gogs-mcp/internal/securelog"
 	"gogs-mcp/internal/snapshot"
@@ -97,6 +100,13 @@ func runServe(
 		writeText(stderr, "Configuration error: %s.\n", err)
 		return exitConfig
 	}
+	if cfg.Transport == config.TransportHTTP && cfg.Token != "" {
+		writeText(stderr, "Configuration error: the http transport authenticates every request with a header credential; remove GOGS_TOKEN and GOGS_TOKEN_FILE and keep them only for verify or cache clean.\n")
+		return exitConfig
+	}
+	if cfg.Transport == config.TransportHTTP {
+		return runServeHTTP(ctx, cfg, stderr)
+	}
 
 	logger := securelog.New(stderr, cfg.LogLevel, cfg.Token, "token "+cfg.Token)
 	cacheDir, err := resolveCacheDir(cfg)
@@ -137,6 +147,56 @@ func runServe(
 	return exitOK
 }
 
+// runServeHTTP hosts the Streamable HTTP transport, where every request
+// carries its caller's Gogs token and users never share a credential.
+func runServeHTTP(ctx context.Context, cfg config.Config, stderr io.Writer) int {
+	cacheRoot, err := resolveCacheDir(cfg)
+	if err != nil {
+		writeText(stderr, "Could not resolve the cache directory: %s.\n", err)
+		return exitConfig
+	}
+	snapshots, err := cacheManagerFor(cfg)
+	if err != nil {
+		writeText(stderr, "Could not initialize the snapshot cache: %s.\n", err)
+		return exitConfig
+	}
+
+	server, err := httpserver.New(httpserver.Options{
+		Addr:           cfg.HTTPAddr,
+		Endpoint:       cfg.HTTPEndpoint,
+		TokenHeader:    cfg.HTTPTokenHeader,
+		UserCacheTTL:   cfg.HTTPUserCacheTTL,
+		MaxUsers:       cfg.HTTPMaxUsers,
+		JSONResponse:   cfg.HTTPJSONResponse,
+		BaseURL:        cfg.BaseURL,
+		CAFile:         cfg.CAFile,
+		UserAgent:      "gogs-mcp/" + version.Version,
+		HTTPTimeout:    cfg.HTTPTimeout,
+		CacheRoot:      cacheRoot,
+		CacheTTL:       cfg.CacheTTL,
+		CacheMaxBytes:  cfg.CacheMaxBytes,
+		SearchDefaults: mcpserver.SearchDefaults{Timeout: cfg.SearchTimeout, MaxFileBytes: cfg.MaxFileBytes},
+		WriteEnabled:   cfg.WriteEnabled,
+		Snapshots:      snapshots,
+		LogDestination: securelog.NewWriter(stderr),
+		LogLevel:       cfg.LogLevel,
+	})
+	if err != nil {
+		writeText(stderr, "Configuration error: %s.\n", err)
+		return exitConfig
+	}
+	if err := server.Run(ctx); err != nil {
+		var listenError *httpserver.ListenError
+		if errors.As(err, &listenError) {
+			writeText(stderr, "Configuration error: %s.\n", err)
+			return exitConfig
+		}
+		writeText(stderr, "The HTTP transport stopped unexpectedly: %s.\n", err)
+		return exitInternal
+	}
+	return exitOK
+}
+
 // cacheManagerFor builds a snapshot manager for cache maintenance commands.
 func cacheManagerFor(cfg config.Config) (*snapshot.Manager, error) {
 	cacheDir, err := resolveCacheDir(cfg)
@@ -167,13 +227,14 @@ func resolveCacheDir(cfg config.Config) (string, error) {
 // ever touching configuration, tokens, or anything outside the cache root.
 func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, lookup config.LookupEnv) int {
 	if len(args) == 0 || args[0] != "clean" {
-		writeText(stderr, "Usage: gogs-mcp cache clean [--config PATH] [--all].\n")
+		writeText(stderr, "Usage: gogs-mcp cache clean [--config PATH] [--user ID | --all].\n")
 		return exitConfig
 	}
 	flags := flag.NewFlagSet("cache clean", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "Read non-sensitive configuration from this JSON file.")
-	all := flags.Bool("all", false, "Remove every verified snapshot cache root.")
+	all := flags.Bool("all", false, "Remove every snapshot and pull request cache, for all users.")
+	userID := flags.Int64("user", 0, "Remove the snapshot and pull request caches of this numeric Gogs user ID without credentials.")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitConfig
 	}
@@ -181,8 +242,12 @@ func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, look
 		writeText(stderr, "cache clean does not accept positional arguments.\n")
 		return exitConfig
 	}
+	if *all && *userID != 0 {
+		writeText(stderr, "cache clean accepts either --all or --user, not both.\n")
+		return exitConfig
+	}
 
-	cfg, err := config.Load(*configPath, lookup)
+	cfg, err := config.LoadForMaintenance(*configPath, lookup)
 	if err != nil {
 		writeText(stderr, "Configuration error: %s.\n", err)
 		return exitConfig
@@ -192,19 +257,43 @@ func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, look
 		writeText(stderr, "Could not initialize the snapshot cache: %s.\n", err)
 		return exitConfig
 	}
+	cacheRoot, err := resolveCacheDir(cfg)
+	if err != nil {
+		writeText(stderr, "Could not resolve the cache directory: %s.\n", err)
+		return exitConfig
+	}
 
-	if *all {
+	switch {
+	case *all:
 		if err := snapshots.RemoveAll(); err != nil {
 			writeText(stderr, "Could not remove the snapshot caches: %s.\n", err)
 			return exitInternal
 		}
-		writeText(stdout, "Removed every snapshot cache for the verified cache roots.\n")
+		if err := removeSharedCacheRoots(cacheRoot); err != nil {
+			writeText(stderr, "Could not remove the shared pull request caches: %s.\n", err)
+			return exitInternal
+		}
+		writeText(stdout, "Removed every snapshot and pull request cache.\n")
 		return exitOK
+	case *userID > 0:
+		if err := snapshots.RemoveUser(*userID); err != nil {
+			writeText(stderr, "Could not remove the snapshot cache: %s.\n", err)
+			return exitInternal
+		}
+		if err := removeUserCacheRoot(cacheRoot, *userID); err != nil {
+			writeText(stderr, "Could not remove the per-user cache: %s.\n", err)
+			return exitInternal
+		}
+		writeText(stdout, "Removed the snapshot and pull request caches for user ID %d.\n", *userID)
+		return exitOK
+	case *userID < 0:
+		writeText(stderr, "The --user value must be a positive Gogs user ID.\n")
+		return exitConfig
 	}
 
-	cacheDir, err := resolveCacheDir(cfg)
-	if err != nil {
-		writeText(stderr, "Could not resolve the cache directory: %s.\n", err)
+	// Without --user or --all the command identifies the caller by token.
+	if cfg.Token == "" {
+		writeText(stderr, "cache clean needs a Gogs token, or pass --user ID or --all to remove caches without credentials.\n")
 		return exitConfig
 	}
 	client, err := gogs.NewClient(gogs.Options{
@@ -213,7 +302,7 @@ func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, look
 		CAFile:    cfg.CAFile,
 		Timeout:   cfg.HTTPTimeout,
 		UserAgent: "gogs-mcp/" + version.Version,
-		CacheDir:  cacheDir,
+		CacheDir:  cacheRoot,
 	})
 	if err != nil {
 		writeText(stderr, "Could not initialize the Gogs client: %s.\n", err)
@@ -237,6 +326,20 @@ func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, look
 	return exitOK
 }
 
+// removeSharedCacheRoots removes the per-user pull request caches that live
+// outside the verified snapshot roots, plus the single-user pull cache a
+// stdio deployment may have left in the cache root itself.
+func removeSharedCacheRoots(cacheRoot string) error {
+	if err := os.RemoveAll(filepath.Join(cacheRoot, "pull")); err != nil {
+		return err
+	}
+	return os.RemoveAll(filepath.Join(cacheRoot, "users"))
+}
+
+func removeUserCacheRoot(cacheRoot string, userID int64) error {
+	return os.RemoveAll(filepath.Join(cacheRoot, "users", strconv.FormatInt(userID, 10)))
+}
+
 func runVerify(
 	ctx context.Context,
 	args []string,
@@ -255,6 +358,17 @@ func runVerify(
 			Error: &diagnosticError{
 				Code:    "CONFIG_INVALID",
 				Message: "The Gogs MCP configuration is invalid.",
+			},
+		})
+		return exitConfig
+	}
+	if strings.TrimSpace(cfg.Token) == "" {
+		writeJSON(stdout, diagnostic{
+			OK: false,
+			Error: &diagnosticError{
+				Code: "CONFIG_INVALID",
+				Message: "verify needs a Gogs token; the http transport takes per-request credentials " +
+					"from headers, so set GOGS_TOKEN or GOGS_TOKEN_FILE only for this command.",
 			},
 		})
 		return exitConfig

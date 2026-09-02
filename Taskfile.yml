@@ -47,7 +47,7 @@ tasks:
         tar -czf {{.PACKAGE_DIR}}/source/gogs-mcp-{{.PACKAGE_VERSION}}.tar.gz -T {{.PACKAGE_STAGING}}/file-list
       - cp package/scripts/install.sh package/scripts/uninstall.sh package/scripts/verify-offline.sh package/scripts/load-image.sh {{.PACKAGE_DIR}}/scripts/
       - cp package/docs/*.md {{.PACKAGE_DIR}}/docs/
-      - cp config.example.json package/config/mcp.example.json package/config/docker-mcp.example.json package/config/podman-mcp.example.json {{.PACKAGE_DIR}}/config/
+      - cp config.example.json package/config/mcp.example.json package/config/docker-mcp.example.json package/config/podman-mcp.example.json package/config/http.example.json {{.PACKAGE_DIR}}/config/
       - |
         # Build the pinned Gogs v0.14.2 E2E image for offline test replays
         # when docker and the pinned Gogs checkout are available.
@@ -167,6 +167,12 @@ tasks:
     cmds:
       - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestLegacyInitializeProtocol$'
 
+  test:e2e:http:
+    desc: Run the Streamable HTTP transport test against isolated Gogs v0.14.2.
+    deps: [build]
+    cmds:
+      - go test -tags=e2e -count=1 -timeout=25m -v ./tests/e2e -run '^TestHTTPTransport$'
+
   test:e2e:
     desc: Run every E2E scenario against isolated Gogs v0.14.2; the offline package test runs through verify:offline.
     cmds:
@@ -177,6 +183,7 @@ tasks:
       - task: test:e2e:search
       - task: test:e2e:issues
       - task: test:e2e:protocol
+      - task: test:e2e:http
 
   lint:
     desc: Run all configured linters.

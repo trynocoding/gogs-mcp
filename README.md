@@ -1,6 +1,6 @@
 # Gogs MCP
 
-Gogs MCP is a local stdio MCP server for Gogs v0.14.2. It exposes read-only tools for inspecting the authenticated user, browsing repositories and their content, reading issues, and reviewing pull requests. Write tools for issues are only registered when `GOGS_MCP_WRITE_ENABLED` is set.
+Gogs MCP is an MCP server for Gogs v0.14.2. It exposes read-only tools for inspecting the authenticated user, browsing repositories and their content, reading issues, and reviewing pull requests, over stdio for a single user or Streamable HTTP for a central deployment. Write tools for issues are only registered when `GOGS_MCP_WRITE_ENABLED` is set.
 
 | Tool | Purpose |
 |---|---|
@@ -65,9 +65,10 @@ task test:e2e:git
 task test:e2e:search
 task test:e2e:issues
 task test:e2e:protocol
+task test:e2e:http
 ```
 
-`task test:e2e` runs every scenario in one command: repository discovery, source browsing, code search, issue creation and maintenance, the legacy MCP initialize handshake, and the authentication and permission failure paths. A log scan after each session proves that no token, private source, or issue body leaks.
+`task test:e2e` runs every scenario in one command: repository discovery, source browsing, code search, issue creation and maintenance, the legacy MCP initialize handshake, the Streamable HTTP transport with two isolated users, and the authentication and permission failure paths. A log scan after each session proves that no token, private source, or issue body leaks.
 
 Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The repository E2E scenario creates an owner, a read-only collaborator, an outsider, and isolated private repositories to verify actual Gogs visibility and permission behavior. Every run uses a random host port, container network, image name, and temporary data directory. The tests remove all of them after success or failure.
 
@@ -81,7 +82,7 @@ Set `GOGS_E2E_SOURCE_DIR` when the Gogs checkout is stored elsewhere. The reposi
 
 Results are bounded and every bound is observable. Up to 50 matches are returned (at most 500 via `max_results`) with file path, 1-based line and byte column, the matching line, and two lines of context before and after (`context_lines`, 0 through 10). Reaching `max_results`, the 64 KiB structured-output limit, or the search time limit (`timeout_seconds`, 1 through 300) sets `meta.truncated` with a warning; a timeout with partial results returns them, and a timeout without results returns `SEARCH_TIMEOUT`. The `include` and `exclude` glob patterns restrict or skip paths, and always exclude `.git`. Binary files (a NUL byte or invalid UTF-8) and files larger than 1 MiB (`GOGS_MCP_MAX_FILE_BYTES`) are skipped and reported in warnings. Repeat searches for the same commit set `meta.cache_hit` and do not contact Gogs again.
 
-The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) are expired and the least recently used snapshots are removed when the per-user cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`), before a new download starts. Snapshots held by an active search are never evicted; when no room can be made, the search fails with `CACHE_CAPACITY_EXCEEDED` instead of downloading. `gogs-mcp cache clean` removes the authenticated user's snapshot and pull request caches and `gogs-mcp cache clean --all` removes every verified cache root; configuration, tokens, and anything outside the cache root are never touched.
+The snapshot cache is bounded: snapshots untouched for 24 hours (`GOGS_MCP_CACHE_TTL`) are expired and the least recently used snapshots are removed when the per-user cache exceeds 2 GiB (`GOGS_MCP_CACHE_MAX_BYTES`), before a new download starts. Snapshots held by an active search are never evicted; when no room can be made, the search fails with `CACHE_CAPACITY_EXCEEDED` instead of downloading. `gogs-mcp cache clean` removes the authenticated user's snapshot and pull request caches, `gogs-mcp cache clean --user <numericID>` removes the caches of one user without credentials, and `gogs-mcp cache clean --all` removes every cache root; configuration, tokens, and anything outside the cache root are never touched.
 
 Gogs issues track repository-internal discussion; Jira remains the requirements system of record, and this server does not sync with Jira. `list_issues` accepts only the `open` and `closed` states because Gogs v0.14.2 treats every other value as open, and it does not accept a page size because Gogs v0.14.2 fixes it server-side. The next page comes from the Gogs `Link` header and is reported as `meta.next_page` only when one exists. `list_issues` returns compact summaries without bodies; `get_issue` returns the full record with body, creator, assignee, labels, milestone, comment count, and timestamps, and reports the shared not-found code without revealing whether the repository or the issue exists. `list_issue_comments` validates the RFC3339 `since` timestamp before contacting Gogs, and bounds the result with `max_comments` (default 100, at most 500) and the 64 KiB structured-output limit; reaching either bound sets `meta.truncated` with a warning.
 
@@ -138,6 +139,30 @@ claude mcp add gogs \
 
 Use `claude mcp get gogs` or `/mcp` in Claude Code to check the connection. The `serve` command reserves stdout for MCP protocol messages and writes JSON logs only to stderr.
 
+## Serve over Streamable HTTP
+
+A central deployment serves every user from one process. Each MCP client sends its own Gogs personal access token in a header, the server resolves it to an isolated per-user tool server with its own Gogs client and cache directories, and an invalid token receives `401`. The server itself holds no credential.
+
+```bash
+GOGS_BASE_URL=https://gogs.internal.example/ \
+GOGS_MCP_TRANSPORT=http \
+GOGS_MCP_HTTP_ADDR=127.0.0.1:8080 \
+.bin/gogs-mcp serve
+```
+
+Register the endpoint with Claude Code:
+
+```bash
+claude mcp add gogs \
+  --transport http \
+  --header "Authorization: token $GOGS_PAT" \
+  https://mcp.internal.example/mcp
+```
+
+The transport is stateless: every request is independent, so any load balancer can distribute the traffic. `GET /healthz` answers `200` without credentials for probes. Terminate TLS with a reverse proxy; the server speaks plain HTTP and warns when it listens on a non-loopback address. See `docs/http-deployment.md` in the offline bundle for reverse proxy snippets, a security checklist, and capacity guidance.
+
+Deployments without a token cannot run `verify` or the token-based `cache clean`; use `GOGS_TOKEN` for that single command, or `cache clean --user <numericID>` and `cache clean --all`, which need no credentials. A revoked token stays accepted for up to the user cache TTL (5 minutes by default, at most 1 hour); tool calls then fail with `AUTHENTICATION_FAILED`. Per-user disk use is bounded by the same cache limits as stdio, so total usage grows with the number of active users, and `cache clean --all` reclaims it.
+
 ## Configuration
 
 An optional JSON file may contain non-sensitive settings:
@@ -151,10 +176,17 @@ Environment variables override file values.
 | Environment variable | Default | Description |
 |---|---|---|
 | `GOGS_BASE_URL` | None. | Required Gogs base URL. An existing subpath is preserved. |
-| `GOGS_TOKEN` | None. | Personal access token supplied directly. |
+| `GOGS_TOKEN` | None. | Personal access token supplied directly. Required for stdio; only for `verify` and `cache clean` over HTTP. |
 | `GOGS_TOKEN_FILE` | None. | Path to a private token file. |
 | `GOGS_CA_FILE` | System trust store. | Additional PEM CA certificate file. |
 | `GOGS_ALLOW_INSECURE_HTTP` | `false`. | Explicitly permits plain HTTP. |
+| `GOGS_MCP_TRANSPORT` | `stdio`. | `stdio` for one local user, `http` for Streamable HTTP. |
+| `GOGS_MCP_HTTP_ADDR` | None. | Listen address `host:port`; required for the `http` transport. |
+| `GOGS_MCP_HTTP_ENDPOINT` | `/mcp`. | Absolute endpoint path of the MCP handler. |
+| `GOGS_MCP_HTTP_TOKEN_HEADER` | `Authorization`. | Header that carries the caller credential; `Bearer` and `token` schemes are accepted. |
+| `GOGS_MCP_HTTP_USER_CACHE_TTL` | `5m`. | How long a resolved user stays cached; at most `1h`. |
+| `GOGS_MCP_HTTP_MAX_USERS` | `128`. | Resolved users kept in cache before least-recently-used eviction; at most `1024`. |
+| `GOGS_MCP_HTTP_JSON_RESPONSE` | `false`. | Answer POSTs with plain JSON instead of SSE streams. |
 | `GOGS_MCP_CACHE_DIR` | OS user cache directory. | Absolute path of the cache root for `search_code` snapshots and pull request diffs. |
 | `GOGS_MCP_CACHE_MAX_BYTES` | `2147483648`. | Cache size per Gogs user before least-recently-used eviction; covers search snapshots and pull request diffs. |
 | `GOGS_MCP_CACHE_TTL` | `24h`. | How long a snapshot or pull request cache entry may stay untouched before it expires. |
@@ -171,7 +203,7 @@ The standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables are honored.
 ```text
 gogs-mcp serve [--config PATH]
 gogs-mcp verify [--config PATH]
-gogs-mcp cache clean [--config PATH] [--all]
+gogs-mcp cache clean [--config PATH] [--user ID | --all]
 gogs-mcp version [--json]
 ```
 

@@ -226,14 +226,15 @@ func (c *Client) GetPullRequestDiff(ctx context.Context, owner, repo string, num
 }
 
 // CleanPullCache drops every cached git object gathered for pull request
-// diffs. It is a no-op when the pull request engine was never used.
+// diffs. The pull request engine is built lazily, so the cache directory is
+// cleaned directly when the engine was never used.
 func (c *Client) CleanPullCache() error {
 	c.pullMu.Lock()
 	defer c.pullMu.Unlock()
-	if c.pull == nil {
-		return nil
+	if c.pull != nil {
+		return c.pull.CleanCache()
 	}
-	return c.pull.CleanCache()
+	return CleanPullCacheDir(c.cacheDir)
 }
 
 // listPullRefs returns every pull request head of a repository.

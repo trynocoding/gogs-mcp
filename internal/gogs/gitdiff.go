@@ -307,6 +307,16 @@ func (e *PullEngine) pullCacheRoot() string {
 	return filepath.Join(e.cacheDir, "pull")
 }
 
+// CleanPullCacheDir removes the pull request git cache below a cache
+// directory. It lets cache maintenance reach the pull cache of a user whose
+// pull request engine was never constructed.
+func CleanPullCacheDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	return os.RemoveAll(filepath.Join(dir, "pull"))
+}
+
 // repoPathFor derives the stable cache path of a clone URL. The caller must
 // hold e.mu.
 func (e *PullEngine) repoPathFor(cloneURL *url.URL) string {

@@ -255,6 +255,19 @@ func (c *fakeClient) GetPullRequestDiff(_ context.Context, _, _ string, number i
 	return c.pullDiff, c.pullDiffErr
 }
 
+func TestWithSchemaCacheSharesOneCache(t *testing.T) {
+	cache := mcp.NewSchemaCache()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	first := New(nil, nil, logger, SearchDefaults{}, false, WithSchemaCache(cache))
+	second := New(nil, nil, logger, SearchDefaults{}, false, WithSchemaCache(cache))
+	assert.Same(t, cache, first.schemaCache)
+	assert.Same(t, cache, second.schemaCache)
+
+	sharedFree := New(nil, nil, logger, SearchDefaults{}, false)
+	assert.Nil(t, sharedFree.schemaCache, "deployments without the option keep the SDK default")
+}
+
 func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 	session := connectTestClient(t, &fakeClient{user: gogs.User{
 		ID:       42,
