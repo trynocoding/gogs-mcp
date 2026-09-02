@@ -74,6 +74,9 @@ type PullRequestDiff struct {
 	Truncated          bool
 	MergeState         string
 	MergeConflictPaths []string
+	// BaseCommits counts the commits the base branch carries since the
+	// merge base; it stays zero while the base has not moved.
+	BaseCommits int
 }
 
 // ListPullRequests returns the most recent pull requests of a repository in
@@ -218,6 +221,7 @@ func (c *Client) GetPullRequestDiff(ctx context.Context, owner, repo string, num
 		Truncated:          diff.Truncated,
 		MergeState:         diff.MergeState,
 		MergeConflictPaths: diff.MergeConflictPaths,
+		BaseCommits:        diff.BaseCommits,
 	}, nil
 }
 

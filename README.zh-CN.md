@@ -95,6 +95,8 @@ Gogs v0.14.2 没有 pull request API。`list_pull_requests`、`get_pull_request`
 
 `get_pull_request_diff` 渲染 merge-base diff：引擎把 pull 引用和 base 分支 fetch 到 `GOGS_MCP_CACHE_DIR` 下的裸缓存仓库，算出 merge base，再按标准 unified 格式编码。结果带每个文件的新增/删除行数、merge base 到头提交之间的提交列表和 merge-base SHA。`max_bytes` 限制渲染出的 diff 大小（默认 256 KiB，至多 4 MiB），触顶时 `meta.truncated` 置位并附警告。`base_ref` 可以覆盖假定的目标分支；没有 pull 引用的 issue 返回 `INVALID_ARGUMENT`。可选的 `paths` 列表把渲染出的 diff 和文件统计限制在匹配路径内——尾斜杠匹配整个目录——而 merge state 始终描述整个 pull request；一条路径都没匹配上时返回空 diff 并附警告。`merge_state` 在 base 分支没有越过 merge base 时报 `fast_forward`，两侧都有新提交但没碰同一个文件时报 `diverged`，两侧都改了同一个文件时报 `conflicting` 并把涉及路径列在 `merge_conflict_paths`。这个状态是从两侧改动文件列表推出的启发式，不是真的执行合并，警告里会说明。git 走 HTTP(S) 时用同一个令牌做 basic auth。
 
+有些仓库把不同的项目放在不同的分支上，pull request 的目标分支可能既不是默认分支，和默认分支也毫无关系。Gogs 依旧不暴露目标分支，所以这类仓库必须显式传 `base_ref`：base 传错，diff 就是对着错误的历史渲染出来的。`base_commits` 字段报告所选 base 分支相对 merge base 前进了多少个提交；当 base 只是假设值时，数字很大就会触发警告明说这一点——零表示默认分支没有越过 merge base。
+
 diff 缓存与快照缓存共用上限：24 小时（`GOGS_MCP_CACHE_TTL`）没被动过的仓库过期，缓存超过 2 GiB（`GOGS_MCP_CACHE_MAX_BYTES`）时按最近最少使用淘汰；正在 diff 的仓库只有在腾不出任何空间时才会被移除。`gogs-mcp cache clean` 会把它和快照缓存一起清掉。
 
 `create_issue`、`update_issue` 和 `create_issue_comment` 仅在设置 `GOGS_MCP_WRITE_ENABLED` 时注册，所以默认服务器提供的工具清单是纯只读的。三个工具都不会自动重试：如果写请求已经到达 Gogs 但响应丢了，工具会报 `WRITE_OUTCOME_UNKNOWN`，这时应该去查 issue 或评论确认结果，而不是再写一次。创建普通 issue 只需要标题（1 到 255 字符），正文可选、最大 1 MiB；只要有读 issue 的权限就能建。要设置指派人、标签或里程碑，需要仓库的 push 权限，否则报 `PERMISSION_DENIED`——因为 Gogs 会悄悄丢弃无写权限用户的这些字段。指派人、每个标签名和里程碑标题会先验证存在，引用不存在时返回 `INVALID_ARGUMENT`。结果里有 issue 编号、状态和 web URL，可以用 `get_issue` 再查。

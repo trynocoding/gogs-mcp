@@ -76,6 +76,10 @@ type PullDiff struct {
 	Truncated          bool           `json:"truncated"`
 	MergeState         string         `json:"merge_state"`
 	MergeConflictPaths []string       `json:"merge_conflict_paths,omitempty"`
+	// BaseCommits counts the commits the base branch carries since the
+	// merge base. A large count together with an assumed base ref suggests
+	// the pull request targets a different branch.
+	BaseCommits int `json:"base_commits"`
 }
 
 // PullEngineOptions configures the pull request engine.
@@ -274,7 +278,7 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 		return nil, &Error{Code: CodeGogsError, Message: "Could not diff the pull request trees.", cause: err}
 	}
 
-	mergeState, conflictPaths, err := e.mergeStateFor(ctx, repo, mergeBase.Hash, baseHash, mergeBaseTree, baseTree, headChanges)
+	mergeState, conflictPaths, baseCommits, err := e.mergeStateFor(ctx, repo, mergeBase.Hash, baseHash, mergeBaseTree, baseTree, headChanges)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +298,7 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	}
 	diff.MergeState = mergeState
 	diff.MergeConflictPaths = conflictPaths
+	diff.BaseCommits = baseCommits
 	return diff, nil
 }
 
@@ -447,15 +452,16 @@ func matchAnyPath(path string, filters []string) bool {
 }
 
 // mergeStateFor compares the two sides of the pull request against the merge
-// base. Only a real merge can decide the outcome, so the conflicting state
-// reports the files that both sides touched.
-func (e *PullEngine) mergeStateFor(ctx context.Context, repo *git.Repository, mergeBase, base plumbing.Hash, mergeBaseTree, baseTree *object.Tree, headChanges object.Changes) (string, []string, error) {
+// base and also reports how many commits the base branch carries since it.
+// Only a real merge can decide the outcome, so the conflicting state reports
+// the files that both sides touched.
+func (e *PullEngine) mergeStateFor(ctx context.Context, repo *git.Repository, mergeBase, base plumbing.Hash, mergeBaseTree, baseTree *object.Tree, headChanges object.Changes) (string, []string, int, error) {
 	baseCommits, err := commitsSince(repo, mergeBase, base)
 	if err != nil {
-		return "", nil, err
+		return "", nil, 0, err
 	}
 	if len(baseCommits) == 0 {
-		return MergeStateFastForward, nil, nil
+		return MergeStateFastForward, nil, 0, nil
 	}
 
 	baseChanges, err := object.DiffTreeWithOptions(ctx, mergeBaseTree, baseTree, &object.DiffTreeOptions{
@@ -463,7 +469,7 @@ func (e *PullEngine) mergeStateFor(ctx context.Context, repo *git.Repository, me
 		RenameScore:   50,
 	})
 	if err != nil {
-		return "", nil, &Error{Code: CodeGogsError, Message: "Could not diff the base ref tree.", cause: err}
+		return "", nil, 0, &Error{Code: CodeGogsError, Message: "Could not diff the base ref tree.", cause: err}
 	}
 
 	headPaths := touchedPaths(headChanges)
@@ -475,9 +481,9 @@ func (e *PullEngine) mergeStateFor(ctx context.Context, repo *git.Repository, me
 	}
 	if len(conflicts) > 0 {
 		sort.Strings(conflicts)
-		return MergeStateConflicting, conflicts, nil
+		return MergeStateConflicting, conflicts, len(baseCommits), nil
 	}
-	return MergeStateDiverged, nil, nil
+	return MergeStateDiverged, nil, len(baseCommits), nil
 }
 
 // touchedPaths collects the source and destination paths of the changes.

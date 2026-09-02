@@ -273,4 +273,8 @@ type PullRequestDiffPage struct {
 	Truncated          bool           `json:"truncated"`
 	MergeState         string         `json:"merge_state"`
 	MergeConflictPaths []string       `json:"merge_conflict_paths,omitempty"`
+	// BaseCommits counts the commits the assumed or passed base branch
+	// carries since the merge base; a large count suggests the pull request
+	// targets a different branch.
+	BaseCommits int `json:"base_commits"`
 }

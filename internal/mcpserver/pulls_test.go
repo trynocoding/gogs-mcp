@@ -276,3 +276,59 @@ func TestGetPullRequestDiffWarnsAboutConflictAndEmptyFilter(t *testing.T) {
 	assert.Contains(t, output.Meta.Warnings[0], "heuristic")
 	assert.Contains(t, output.Meta.Warnings[1], "No changes matched the requested paths")
 }
+
+func TestGetPullRequestDiffWarnsWhenAssumedBaseMovesAhead(t *testing.T) {
+	moved := &fakeClient{
+		pullDiff: gogs.PullRequestDiff{
+			Number:         1,
+			BaseRef:        "main",
+			BaseRefAssumed: true,
+			MergeBase:      "8bb8836",
+			Diff:           "diff --git a/ops/multiply.go b/ops/multiply.go\n...",
+			MergeState:     gogs.MergeStateConflicting,
+			BaseCommits:    412,
+		},
+	}
+	session := connectTestClient(t, moved)
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "get_pull_request_diff",
+		Arguments: map[string]any{"owner": "owner", "repo": "calculator", "number": 1},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+
+	var output ToolResponse[PullRequestDiffPage]
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Data)
+	assert.Equal(t, 412, output.Data.BaseCommits)
+	require.NotEmpty(t, output.Meta.Warnings)
+	assert.Contains(t, output.Meta.Warnings[0], "The assumed base branch main carries 412 commits since the merge base")
+	assert.Contains(t, output.Meta.Warnings[0], "pass base_ref explicitly")
+	assert.NotContains(t, output.Meta.Warnings[0], "Gogs does not expose")
+
+	// An explicit base ref must not carry the assumed-base warning, no
+	// matter how far the base has moved.
+	explicit := &fakeClient{
+		pullDiff: gogs.PullRequestDiff{
+			Number:      1,
+			BaseRef:     "bws-monitor",
+			MergeBase:   "8bb8836",
+			BaseCommits: 412,
+		},
+	}
+	session = connectTestClient(t, explicit)
+	result, err = session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "get_pull_request_diff",
+		Arguments: map[string]any{
+			"owner": "owner", "repo": "calculator", "number": 1, "base_ref": "bws-monitor",
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+
+	output = ToolResponse[PullRequestDiffPage]{}
+	decodeStructuredContent(t, result.StructuredContent, &output)
+	require.NotNil(t, output.Data)
+	assert.Equal(t, 412, output.Data.BaseCommits)
+	assert.Empty(t, output.Meta.Warnings)
+}

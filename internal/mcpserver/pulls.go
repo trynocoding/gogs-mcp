@@ -112,7 +112,11 @@ func registerPullTools(server *mcp.Server, client Client) {
 			meta.Warnings = append(meta.Warnings, "The rendered diff was cut off at the byte limit; raise max_bytes or narrow the review with base_ref and get_file.")
 		}
 		if diff.BaseRefAssumed {
-			meta.Warnings = append(meta.Warnings, "Gogs does not expose the pull request target branch; the diff uses the repository default branch. Pass base_ref to override it.")
+			if diff.BaseCommits > 0 {
+				meta.Warnings = append(meta.Warnings, fmt.Sprintf("The assumed base branch %s carries %d commits since the merge base; if this pull request targets a different branch (for example when branches host separate projects), pass base_ref explicitly.", diff.BaseRef, diff.BaseCommits))
+			} else {
+				meta.Warnings = append(meta.Warnings, "Gogs does not expose the pull request target branch; the diff uses the repository default branch. Pass base_ref to override it.")
+			}
 		}
 		if diff.MergeState == gogs.MergeStateConflicting {
 			meta.Warnings = append(meta.Warnings, fmt.Sprintf("The pull request head and the base branch both touch %s, so the merge may conflict; this is a heuristic from the changed file lists, and only a real merge can decide the outcome.", quotedPathList(diff.MergeConflictPaths)))
@@ -132,6 +136,7 @@ func registerPullTools(server *mcp.Server, client Client) {
 				Truncated:          diff.Truncated,
 				MergeState:         diff.MergeState,
 				MergeConflictPaths: diff.MergeConflictPaths,
+				BaseCommits:        diff.BaseCommits,
 			},
 			Meta: meta,
 		}, nil

@@ -100,6 +100,7 @@ func TestDiffPullProducesStandardUnifiedDiff(t *testing.T) {
 	assert.False(t, diff.Truncated)
 	// The base branch has not moved past the merge base.
 	assert.Equal(t, MergeStateFastForward, diff.MergeState)
+	assert.Zero(t, diff.BaseCommits)
 
 	require.Len(t, diff.Files, 3)
 	// Entries follow the lexicographic order of the unified diff.
@@ -278,6 +279,7 @@ func TestDiffPullReportsMergeStates(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, MergeStateFastForward, diff.MergeState)
 		assert.Empty(t, diff.MergeConflictPaths)
+		assert.Zero(t, diff.BaseCommits)
 	})
 
 	t.Run("diverged", func(t *testing.T) {
@@ -287,6 +289,7 @@ func TestDiffPullReportsMergeStates(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, MergeStateDiverged, diff.MergeState)
 		assert.Empty(t, diff.MergeConflictPaths)
+		assert.Equal(t, 1, diff.BaseCommits)
 	})
 
 	t.Run("conflicting", func(t *testing.T) {
@@ -296,6 +299,7 @@ func TestDiffPullReportsMergeStates(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, MergeStateConflicting, diff.MergeState)
 		assert.Equal(t, []string{"file.txt"}, diff.MergeConflictPaths)
+		assert.Equal(t, 1, diff.BaseCommits)
 	})
 }
 
