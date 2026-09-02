@@ -322,7 +322,7 @@ func TestCreateIssueIsAbsentWithoutWriteEnabled(t *testing.T) {
 		assert.NotEqual(t, "update_issue", tool.Name)
 		assert.NotEqual(t, "create_issue_comment", tool.Name)
 	}
-	assert.Len(t, list.Tools, 14)
+	assert.Len(t, list.Tools, 17)
 }
 
 func TestCreateIssueAdvertisesWriteAnnotations(t *testing.T) {
@@ -341,7 +341,7 @@ func TestCreateIssueAdvertisesWriteAnnotations(t *testing.T) {
 	assert.True(t, *tool.Annotations.OpenWorldHint)
 	assert.Contains(t, tool.Description, "Jira remains the requirements system of record")
 	assert.Contains(t, tool.Description, "does not sync with Jira")
-	assert.Len(t, list.Tools, 17)
+	assert.Len(t, list.Tools, 20)
 }
 
 func TestUpdateIssueAdvertisesAnnotations(t *testing.T) {

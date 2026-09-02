@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -25,7 +26,10 @@ type Options struct {
 	CAFile    string
 	Timeout   time.Duration
 	UserAgent string
-	Logger    *slog.Logger
+	// CacheDir hosts the git object cache of the pull request engine. When
+	// empty, the pull request tools are unavailable.
+	CacheDir string
+	Logger   *slog.Logger
 }
 
 type Client struct {
@@ -34,6 +38,10 @@ type Client struct {
 	userAgent string
 	http      *http.Client
 	logger    *slog.Logger
+	cacheDir  string
+
+	pullMu sync.Mutex
+	pull   *PullEngine
 }
 
 type requestMetadata struct {
@@ -117,6 +125,7 @@ func NewClient(options Options) (*Client, error) {
 		userAgent: options.UserAgent,
 		http:      client,
 		logger:    logger,
+		cacheDir:  options.CacheDir,
 	}, nil
 }
 

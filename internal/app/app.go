@@ -99,12 +99,18 @@ func runServe(
 	}
 
 	logger := securelog.New(stderr, cfg.LogLevel, cfg.Token, "token "+cfg.Token)
+	cacheDir, err := resolveCacheDir(cfg)
+	if err != nil {
+		logger.Error("Could not resolve the cache directory.", "error", err)
+		return exitConfig
+	}
 	client, err := gogs.NewClient(gogs.Options{
 		APIRoot:   cfg.APIRoot(),
 		Token:     cfg.Token,
 		CAFile:    cfg.CAFile,
 		Timeout:   cfg.HTTPTimeout,
 		UserAgent: "gogs-mcp/" + version.Version,
+		CacheDir:  cacheDir,
 		Logger:    logger,
 	})
 	if err != nil {
@@ -131,18 +137,28 @@ func runServe(
 
 // cacheManagerFor builds a snapshot manager for cache maintenance commands.
 func cacheManagerFor(cfg config.Config) (*snapshot.Manager, error) {
-	cacheDir := cfg.CacheDir
-	if cacheDir == "" {
-		userCache, err := os.UserCacheDir()
-		if err != nil {
-			return nil, err
-		}
-		cacheDir = filepath.Join(userCache, "gogs-mcp")
+	cacheDir, err := resolveCacheDir(cfg)
+	if err != nil {
+		return nil, err
 	}
 	return snapshot.NewManager(cacheDir, cfg.BaseURL.String(), snapshot.DefaultLimits(), snapshot.Eviction{
 		MaxBytes: cfg.CacheMaxBytes,
 		TTL:      cfg.CacheTTL,
 	})
+}
+
+// resolveCacheDir returns the configured cache directory, falling back to the
+// user cache. It hosts the verified snapshot caches and the git object cache
+// of the pull request tools.
+func resolveCacheDir(cfg config.Config) (string, error) {
+	if cfg.CacheDir != "" {
+		return cfg.CacheDir, nil
+	}
+	userCache, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(userCache, "gogs-mcp"), nil
 }
 
 // runCache implements `cache clean`, which removes snapshot caches without
@@ -184,12 +200,18 @@ func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, look
 		return exitOK
 	}
 
+	cacheDir, err := resolveCacheDir(cfg)
+	if err != nil {
+		writeText(stderr, "Could not resolve the cache directory: %s.\n", err)
+		return exitConfig
+	}
 	client, err := gogs.NewClient(gogs.Options{
 		APIRoot:   cfg.APIRoot(),
 		Token:     cfg.Token,
 		CAFile:    cfg.CAFile,
 		Timeout:   cfg.HTTPTimeout,
 		UserAgent: "gogs-mcp/" + version.Version,
+		CacheDir:  cacheDir,
 	})
 	if err != nil {
 		writeText(stderr, "Could not initialize the Gogs client: %s.\n", err)
@@ -205,7 +227,11 @@ func runCache(ctx context.Context, args []string, stdout, stderr io.Writer, look
 		writeText(stderr, "Could not remove the snapshot cache: %s.\n", err)
 		return exitInternal
 	}
-	writeText(stdout, "Removed the snapshot cache for user %s.\n", user.Username)
+	if err := client.CleanPullCache(); err != nil {
+		writeText(stderr, "Could not remove the pull request git cache: %s.\n", err)
+		return exitInternal
+	}
+	writeText(stdout, "Removed the snapshot and pull request caches for user %s.\n", user.Username)
 	return exitOK
 }
 

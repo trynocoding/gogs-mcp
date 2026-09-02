@@ -92,6 +92,22 @@ type fakeClient struct {
 	createCommentCalls int
 	commentedNumber    int64
 	commentedBody      string
+	pullSummaries      []gogs.PullRequestSummary
+	pullTotal          int
+	listPullsErr       error
+	listPullsCalls     int
+	listPullsState     string
+	listPullsLimit     int
+	pull               gogs.PullRequest
+	getPullErr         error
+	getPullCalls       int
+	getPullNumber      int64
+	pullDiff           gogs.PullRequestDiff
+	pullDiffErr        error
+	pullDiffCalls      int
+	pullDiffNumber     int64
+	pullDiffBaseRef    string
+	pullDiffMaxBytes   int
 }
 
 func (c *fakeClient) GetAuthenticatedUser(context.Context) (gogs.User, error) {
@@ -216,6 +232,27 @@ func (c *fakeClient) CreateIssueComment(_ context.Context, _, _ string, number i
 	return c.createdComment, c.createCommentErr
 }
 
+func (c *fakeClient) ListPullRequests(_ context.Context, _, _, state string, limit int) ([]gogs.PullRequestSummary, int, error) {
+	c.listPullsCalls++
+	c.listPullsState = state
+	c.listPullsLimit = limit
+	return c.pullSummaries, c.pullTotal, c.listPullsErr
+}
+
+func (c *fakeClient) GetPullRequest(_ context.Context, _, _ string, number int64) (gogs.PullRequest, error) {
+	c.getPullCalls++
+	c.getPullNumber = number
+	return c.pull, c.getPullErr
+}
+
+func (c *fakeClient) GetPullRequestDiff(_ context.Context, _, _ string, number int64, baseRef string, maxBytes int) (gogs.PullRequestDiff, error) {
+	c.pullDiffCalls++
+	c.pullDiffNumber = number
+	c.pullDiffBaseRef = baseRef
+	c.pullDiffMaxBytes = maxBytes
+	return c.pullDiff, c.pullDiffErr
+}
+
 func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 	session := connectTestClient(t, &fakeClient{user: gogs.User{
 		ID:       42,
@@ -226,7 +263,7 @@ func TestServerNegotiatesAndReturnsAuthenticatedUser(t *testing.T) {
 
 	list, err := session.ListTools(context.Background(), nil)
 	require.NoError(t, err)
-	require.Len(t, list.Tools, 14)
+	require.Len(t, list.Tools, 17)
 	tool := findTool(t, list.Tools, "get_authenticated_user")
 	require.NotNil(t, tool.Annotations)
 	assert.True(t, tool.Annotations.ReadOnlyHint)

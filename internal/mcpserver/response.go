@@ -210,3 +210,65 @@ type IssueCommentPage struct {
 	Since    string         `json:"since,omitempty"`
 	Max      int            `json:"max_comments"`
 }
+
+// PullRequestSummary is the compact pull request listing entry; bodies are
+// only returned by get_pull_request to keep listing output bounded.
+type PullRequestSummary struct {
+	Number      int64     `json:"number"`
+	Title       string    `json:"title"`
+	State       string    `json:"state"`
+	User        IssueUser `json:"user"`
+	NumComments int       `json:"num_comments"`
+	CreatedAt   string    `json:"created_at"`
+	UpdatedAt   string    `json:"updated_at"`
+	HeadSHA     string    `json:"head_sha"`
+}
+
+type PullRequestPage struct {
+	PullRequests []PullRequestSummary `json:"pull_requests"`
+	State        string               `json:"state"`
+	Limit        int                  `json:"limit"`
+	Total        int                  `json:"total"`
+}
+
+type PullRequest struct {
+	Number         int64        `json:"number"`
+	Title          string       `json:"title"`
+	Body           string       `json:"body"`
+	State          string       `json:"state"`
+	User           IssueUser    `json:"user"`
+	Labels         []IssueLabel `json:"labels"`
+	NumComments    int          `json:"num_comments"`
+	CreatedAt      string       `json:"created_at"`
+	UpdatedAt      string       `json:"updated_at"`
+	WebURL         string       `json:"web_url"`
+	HeadSHA        string       `json:"head_sha"`
+	BaseRef        string       `json:"base_ref"`
+	BaseRefAssumed bool         `json:"base_ref_assumed"`
+}
+
+type DiffFileStat struct {
+	Path      string `json:"path"`
+	Status    string `json:"status"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	IsBinary  bool   `json:"is_binary"`
+}
+
+type PullCommit struct {
+	SHA     string `json:"sha"`
+	Message string `json:"message"`
+	Author  string `json:"author"`
+	Date    string `json:"date"`
+}
+
+type PullRequestDiffPage struct {
+	Number         int64          `json:"number"`
+	BaseRef        string         `json:"base_ref"`
+	BaseRefAssumed bool           `json:"base_ref_assumed"`
+	MergeBase      string         `json:"merge_base"`
+	Diff           string         `json:"diff"`
+	Files          []DiffFileStat `json:"files"`
+	Commits        []PullCommit   `json:"commits"`
+	Truncated      bool           `json:"truncated"`
+}

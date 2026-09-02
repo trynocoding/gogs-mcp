@@ -139,6 +139,9 @@ func TestServeOverStdioWithOfficialClient(t *testing.T) {
 		"list_issues",
 		"get_issue",
 		"list_issue_comments",
+		"list_pull_requests",
+		"get_pull_request",
+		"get_pull_request_diff",
 	}, names)
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
@@ -422,6 +425,9 @@ func TestServeOverStdioRegistersWriteToolsWhenEnabled(t *testing.T) {
 		"list_issues",
 		"get_issue",
 		"list_issue_comments",
+		"list_pull_requests",
+		"get_pull_request",
+		"get_pull_request_diff",
 		"create_issue",
 		"update_issue",
 		"create_issue_comment",
