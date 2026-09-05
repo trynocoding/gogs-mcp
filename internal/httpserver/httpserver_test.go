@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -261,6 +263,23 @@ func TestHandlerServesToolsPerUser(t *testing.T) {
 	assert.Equal(t, "alice", callUserTool(t, ctx, aliceAgain)["username"])
 }
 
+func TestUserCacheRootIsPrivate(t *testing.T) {
+	fixture := newFixture(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	session := fixture.connect(t, ctx, aliceToken)
+	callUserTool(t, ctx, session)
+
+	entries, err := os.ReadDir(filepath.Join(fixture.server.options.CacheRoot, "users"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	info, err := entries[0].Info()
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(),
+		"the per-user cache root must stay private to the server process")
+}
+
 func TestInvalidTokenProbesGogsOnce(t *testing.T) {
 	fixture := newFixture(t, nil)
 
@@ -402,6 +421,18 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 	}
 	_, err := New(options)
 	require.Error(t, err)
+}
+
+func TestNewRejectsReservedEndpoint(t *testing.T) {
+	options := Options{
+		Addr:      "127.0.0.1:8080",
+		BaseURL:   &url.URL{Scheme: "http", Host: "127.0.0.1:3000"},
+		CacheRoot: t.TempDir(),
+		Endpoint:  "/healthz",
+	}
+	_, err := New(options)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved")
 }
 
 func TestRunFailsWithListenError(t *testing.T) {

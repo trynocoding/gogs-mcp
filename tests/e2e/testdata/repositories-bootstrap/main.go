@@ -34,10 +34,12 @@ type result struct {
 type repositoryRefs struct {
 	DefaultBranch string `json:"default_branch"`
 	FeatureBranch string `json:"feature_branch"`
+	ReleaseBranch string `json:"release_branch"`
 	Tag           string `json:"tag"`
 	MainCommitSHA string `json:"main_commit_sha"`
 	FeatureSHA    string `json:"feature_sha"`
 	TagSHA        string `json:"tag_sha"`
+	PullSHA       string `json:"pull_sha"`
 }
 
 func main() {
@@ -81,7 +83,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	refs, err := seedRepository(shared)
+	refs, err := seedRepository(shared, owner)
 	if err != nil {
 		return err
 	}
@@ -142,7 +144,7 @@ func createRepository(owner *database.User, name, description string) (*database
 	return repository, nil
 }
 
-func seedRepository(repository *database.Repository) (repositoryRefs, error) {
+func seedRepository(repository *database.Repository, owner *database.User) (repositoryRefs, error) {
 	repositoryPath := repository.RepoPath()
 	if err := os.RemoveAll(filepath.Join(repositoryPath, "hooks")); err != nil {
 		return repositoryRefs{}, errors.Wrap(err, "remove Gogs delegate hooks")
@@ -221,6 +223,12 @@ func seedRepository(repository *database.Repository) (repositoryRefs, error) {
 	if err := runGit(worktree, "tag", "v1.0.0"); err != nil {
 		return repositoryRefs{}, err
 	}
+	// The pull request diff tests need an explicit base ref that sits at the
+	// merge base; a branch marks the tagged commit because the base_ref input
+	// accepts branch names only.
+	if err := runGit(worktree, "branch", "release/v1.0"); err != nil {
+		return repositoryRefs{}, err
+	}
 
 	if err := runGit(worktree, "checkout", "-b", "feature/content"); err != nil {
 		return repositoryRefs{}, err
@@ -228,7 +236,14 @@ func seedRepository(repository *database.Repository) (repositoryRefs, error) {
 	if err := os.WriteFile(filepath.Join(worktree, "src", "version.txt"), []byte("feature-version\n第二行\nthird\n"), 0o644); err != nil {
 		return repositoryRefs{}, errors.Wrap(err, "write feature fixture")
 	}
-	if err := runGit(worktree, "commit", "-am", "Change feature version"); err != nil {
+	// Both branch commits stage only the version file: "commit -a" would
+	// also stage the removal of the vendored gitlink, whose directory does
+	// not exist in the seed worktree, and both branches must keep the
+	// submodule.
+	if err := runGit(worktree, "add", "src/version.txt"); err != nil {
+		return repositoryRefs{}, err
+	}
+	if err := runGit(worktree, "commit", "-m", "Change feature version"); err != nil {
 		return repositoryRefs{}, err
 	}
 	featureSHA, err := gitOutput(worktree, "rev-parse", "HEAD")
@@ -242,26 +257,50 @@ func seedRepository(repository *database.Repository) (repositoryRefs, error) {
 	if err := os.WriteFile(filepath.Join(worktree, "src", "version.txt"), []byte("main-version\n第二行\nthird\n"), 0o644); err != nil {
 		return repositoryRefs{}, errors.Wrap(err, "write main fixture")
 	}
+	if err := runGit(worktree, "add", "src/version.txt"); err != nil {
+		return repositoryRefs{}, err
+	}
 	// The body is part of the fixture because Gogs v0.14.2 only exposes the
 	// first line of a commit message, which the git E2E asserts.
-	if err := runGit(worktree, "commit", "-am", "Change main version\n\nThis body line is not exposed by Gogs v0.14.2."); err != nil {
+	if err := runGit(worktree, "commit", "-m", "Change main version\n\nThis body line is not exposed by Gogs v0.14.2."); err != nil {
 		return repositoryRefs{}, err
 	}
 	mainSHA, err := gitOutput(worktree, "rev-parse", "HEAD")
 	if err != nil {
 		return repositoryRefs{}, err
 	}
-	if err := runGit(worktree, "push", "origin", "main", "feature/content", "--tags"); err != nil {
+	if err := runGit(worktree, "push", "origin", "main", "feature/content", "release/v1.0", "--tags"); err != nil {
 		return repositoryRefs{}, err
+	}
+
+	// Gogs v0.14.2 has no pull request REST API; the pull request tooling
+	// reads the refs/pull/{index}/head convention plus the underlying issue,
+	// so the fixture leaves both behind the way an opened pull request does.
+	// The ref is written directly on the bare repository, matching how Gogs
+	// itself records the head of pull request #1.
+	if err := runGit("", "--git-dir", repositoryPath, "update-ref", "refs/pull/1/head", featureSHA); err != nil {
+		return repositoryRefs{}, err
+	}
+	pull := &database.Issue{
+		RepoID:   repository.ID,
+		PosterID: owner.ID,
+		Poster:   owner,
+		Title:    "Merge feature/content into main",
+		Content:  "The pull request fixture of the E2E suite.",
+	}
+	if err := database.NewIssue(repository, pull, nil, nil); err != nil {
+		return repositoryRefs{}, errors.Wrap(err, "create Gogs E2E pull request issue")
 	}
 
 	return repositoryRefs{
 		DefaultBranch: "main",
 		FeatureBranch: "feature/content",
+		ReleaseBranch: "release/v1.0",
 		Tag:           "v1.0.0",
 		MainCommitSHA: mainSHA,
 		FeatureSHA:    featureSHA,
 		TagSHA:        tagSHA,
+		PullSHA:       featureSHA,
 	}, nil
 }
 

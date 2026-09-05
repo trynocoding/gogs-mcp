@@ -91,9 +91,10 @@ type PullEngineOptions struct {
 	// CacheTTL expires diff cache repositories untouched for this long;
 	// non-positive values fall back to defaultPullCacheTTL.
 	CacheTTL time.Duration
-	// CacheMaxBytes evicts the least recently used diff cache repositories
-	// once the total exceeds this size; non-positive values fall back to
-	// defaultPullCacheMaxBytes.
+	// CacheMaxBytes keeps the diff cache within this size: the least
+	// recently used repositories are evicted once the total exceeds it, and
+	// a repository that alone exceeds it is dropped instead of cached.
+	// Non-positive values fall back to defaultPullCacheMaxBytes.
 	CacheMaxBytes int64
 	Logger        *slog.Logger
 }
@@ -173,6 +174,11 @@ func (e *PullEngine) ListPullRefs(ctx context.Context, cloneURL *url.URL) ([]Pul
 	refs, err := remote.ListContext(ctx, &git.ListOptions{
 		Auth: e.authFor(cloneURL),
 	})
+	if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+		// An empty repository advertises no refs, which go-git surfaces as an
+		// error; an empty pull request listing is the faithful answer.
+		return []PullRef{}, nil
+	}
 	if err != nil {
 		return nil, classifyGitError(err)
 	}
@@ -188,6 +194,10 @@ func (e *PullEngine) ListPullRefs(ctx context.Context, cloneURL *url.URL) ([]Pul
 			HeadSHA: ref.Hash().String(),
 		})
 	}
+	// The remote advertisement is a map iteration in go-git, so the refs
+	// arrive in arbitrary order; callers walk the slice expecting ascending
+	// numbers.
+	sort.Slice(pullRefs, func(i, j int) bool { return pullRefs[i].Number < pullRefs[j].Number })
 	return pullRefs, nil
 }
 
@@ -220,6 +230,25 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	}
 	if err := e.fetchRefs(ctx, repo, cloneURL, number, baseRef); err != nil {
 		return nil, err
+	}
+	// The fetch is a fresh use of the repository; refresh the TTL timestamp
+	// before any sweep can run, so a fetch that crosses the expiry boundary
+	// is never swept away mid-call.
+	touchCache(repoPath)
+	if err := e.enforceCacheCapacity(repoPath); err != nil {
+		return nil, err
+	}
+	// The single-repository check above guarantees the bound is reachable by
+	// evicting the older repositories. Eviction can fail on a hostile
+	// filesystem, and the sweep then drops the just-fetched repository to
+	// keep the bound honest; report that as a capacity error instead of
+	// reading a repository whose directory has just been removed.
+	if e.sweepPullCache(time.Now(), repoPath) {
+		return nil, &Error{
+			Code:      CodeCacheCapacityExceeded,
+			Message:   "The pull cache could not be kept within its size limit; raise GOGS_MCP_CACHE_MAX_BYTES to serve this repository.",
+			Retryable: true,
+		}
 	}
 
 	headHash, err := resolveCachedRef(repo, fmt.Sprintf("refs/gogs-mcp/pull/%d/head", number))
@@ -292,7 +321,7 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	}
 
 	touchCache(repoPath)
-	diff, err := buildPullDiff(patch, commits, mergeBase.Hash.String(), maxBytes)
+	diff, err := buildPullDiff(headChanges, patch, commits, mergeBase.Hash.String(), maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -324,15 +353,19 @@ func (e *PullEngine) repoPathFor(cloneURL *url.URL) string {
 	return filepath.Join(e.pullCacheRoot(), hex.EncodeToString(sum[:8])+".git")
 }
 
-// sweepPullCache enforces the TTL and the size bound of the diff cache. The
-// repository about to be used is evicted last, and only if the cache remains
-// oversized; cachedRepo rebuilds whatever the sweep removes. Failures are
+// sweepPullCache enforces the TTL and the size bound of the diff cache
+// before and after a fetch. The repository about to be used, or just
+// fetched, is evicted last, and only if the cache remains oversized;
+// cachedRepo rebuilds whatever the sweep removes before a fetch, while the
+// caller of a fetch reports the cache capacity error itself. Failures are
 // logged and otherwise ignored, because the sweep is an optimization rather
-// than a correctness step. The caller must hold e.mu.
-func (e *PullEngine) sweepPullCache(now time.Time, keep string) {
+// than a correctness step. The return value reports whether the keep
+// repository was dropped to restore the bound, which the caller turns into
+// a capacity error. The caller must hold e.mu.
+func (e *PullEngine) sweepPullCache(now time.Time, keep string) bool {
 	entries, err := os.ReadDir(e.pullCacheRoot())
 	if err != nil {
-		return
+		return false
 	}
 	type cached struct {
 		path     string
@@ -363,14 +396,14 @@ func (e *PullEngine) sweepPullCache(now time.Time, keep string) {
 		alive = append(alive, cached{path: path, size: size, modified: info.ModTime()})
 	}
 	if total <= e.cacheMaxBytes {
-		return
+		return false
 	}
 	sort.SliceStable(alive, func(i, j int) bool {
 		return alive[i].modified.Before(alive[j].modified)
 	})
 	for _, item := range alive {
 		if total <= e.cacheMaxBytes {
-			return
+			return false
 		}
 		if item.path == keep {
 			continue
@@ -389,6 +422,31 @@ func (e *PullEngine) sweepPullCache(now time.Time, keep string) {
 		if err := os.RemoveAll(keep); err != nil {
 			e.logger.Warn("Could not remove the oversized pull cache repository.", "path", keep, "error", err)
 		}
+		return true
+	}
+	return false
+}
+
+// enforceCacheCapacity keeps the size bound honest after a fetch: the sweep
+// runs beforehand and cannot know how large the incoming objects are. A
+// repository that arrives above the limit is dropped immediately and
+// reported, because no amount of eviction could keep it. The sweep then
+// evicts the older repositories until the total is within the bound again,
+// which also covers a cache that breaches the limit through the
+// accumulation of individually fitting repositories. The caller must hold
+// e.mu.
+func (e *PullEngine) enforceCacheCapacity(repoPath string) error {
+	size := dirSize(repoPath)
+	if size <= e.cacheMaxBytes {
+		return nil
+	}
+	if err := os.RemoveAll(repoPath); err != nil {
+		e.logger.Warn("Could not remove the oversized pull cache repository.", "path", repoPath, "error", err)
+	}
+	return &Error{
+		Code:      CodeCacheCapacityExceeded,
+		Message:   fmt.Sprintf("The fetched repository is %d bytes and exceeds the pull cache limit of %d bytes; raise GOGS_MCP_CACHE_MAX_BYTES to serve this repository.", size, e.cacheMaxBytes),
+		Retryable: true,
 	}
 }
 
@@ -512,15 +570,24 @@ func touchedPaths(changes object.Changes) map[string]bool {
 
 // buildPullDiff renders the patch text and collects the per-file stats. The
 // stats are always complete; the diff text stops after maxBytes. A
-// non-positive maxBytes means no limit.
-func buildPullDiff(patch *object.Patch, commits []PullCommit, mergeBase string, maxBytes int) (*PullDiff, error) {
+// non-positive maxBytes means no limit. Submodule changes only surface in
+// the stats: go-git's unified encoder emits no hunk for a gitlink, so their
+// entries report zero line counts with is_binary set while the diff text
+// stays silent about them.
+func buildPullDiff(changes object.Changes, patch *object.Patch, commits []PullCommit, mergeBase string, maxBytes int) (*PullDiff, error) {
 	filePatches := patch.FilePatches()
+	// getPatchContext appends exactly one file patch per tree change, in
+	// order; this guard is a cheap check on that invariant, because its
+	// failure would otherwise panic on the index below after a future
+	// go-git upgrade.
+	if len(filePatches) != len(changes) {
+		return nil, &Error{Code: CodeInternal, Message: "The pull request patch does not match its tree changes."}
+	}
 	files := make([]DiffFileStat, 0, len(filePatches))
-	for _, filePatch := range filePatches {
-		from, to := filePatch.Files()
+	for index, filePatch := range filePatches {
 		files = append(files, DiffFileStat{
-			Path:      diffPath(from, to),
-			Status:    diffStatus(from, to),
+			Path:      diffEntryPath(changes[index]),
+			Status:    diffChangeStatus(changes[index]),
 			Additions: countChunkLines(filePatch, fdiff.Add),
 			Deletions: countChunkLines(filePatch, fdiff.Delete),
 			IsBinary:  filePatch.IsBinary(),
@@ -547,22 +614,35 @@ func buildPullDiff(patch *object.Patch, commits []PullCommit, mergeBase string, 
 }
 
 // cachedRepo opens the bare cache repository for the clone URL, recreating
-// it whenever it is missing or unusable. The caller must hold e.mu.
+// it whenever it is missing, unusable, or cannot be made private. The
+// repository is private to the process (0700): the fetched objects carry
+// repository data that only the authenticated token was meant to see, and
+// the 0700 mode gates access even to the world-readable pack files git
+// writes. The caller must hold e.mu.
 func (e *PullEngine) cachedRepo(cloneURL *url.URL) (*git.Repository, error) {
 	repoPath := e.repoPathFor(cloneURL)
 
 	repo, openErr := git.PlainOpen(repoPath)
 	if openErr == nil {
-		return repo, nil
-	}
-	if !errors.Is(openErr, git.ErrRepositoryNotExists) {
+		// Repositories created by earlier versions may still be group or
+		// world readable; tighten them, because an actively used repository
+		// never ages out through the TTL sweep.
+		err := os.Chmod(repoPath, 0o700)
+		if err == nil {
+			return repo, nil
+		}
+		// Serving objects from a path that cannot be made private would
+		// expose repository data, so the repository is discarded; the
+		// rebuild below either replaces it with a private one or fails.
+		e.logger.Warn("Discarding the pull cache repository whose permissions could not be tightened.", "path", repoPath, "error", err)
+	} else if !errors.Is(openErr, git.ErrRepositoryNotExists) {
 		// An unreadable cache is not worth reporting; rebuild it from scratch.
 		e.logger.Warn("Discarding the unusable pull cache repository.", "path", repoPath, "error", openErr)
 	}
 	if err := os.RemoveAll(repoPath); err != nil {
 		return nil, &Error{Code: CodeInternal, Message: "Could not reset the pull cache repository.", cause: err}
 	}
-	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+	if err := os.MkdirAll(repoPath, 0o700); err != nil {
 		return nil, &Error{Code: CodeInternal, Message: "Could not create the pull cache directory.", cause: err}
 	}
 	repo, err := git.PlainInit(repoPath, true)
@@ -718,20 +798,27 @@ func commitsSince(repo *git.Repository, mergeBase, head plumbing.Hash) ([]PullCo
 	return commits, nil
 }
 
-func diffPath(from, to fdiff.File) string {
-	if from == nil {
-		return to.Path()
+// diffEntryPath derives the reported path from the tree change alone. A
+// rename surfaces under its new name, which matches the filter matching of
+// filterChanges and the b/ side of the diff header. A submodule change
+// carries no readable file on either side, because gitlink entries have no
+// file content, so the tree change is the only source either way.
+func diffEntryPath(change *object.Change) string {
+	if change.To != (object.ChangeEntry{}) {
+		return change.To.Name
 	}
-	return from.Path()
+	return change.From.Name
 }
 
-func diffStatus(from, to fdiff.File) string {
+// diffChangeStatus maps a tree change onto the same status vocabulary the
+// file-based diffs report.
+func diffChangeStatus(change *object.Change) string {
 	switch {
-	case from == nil:
+	case change.From == (object.ChangeEntry{}):
 		return "added"
-	case to == nil:
+	case change.To == (object.ChangeEntry{}):
 		return "deleted"
-	case from.Path() != to.Path():
+	case change.From.Name != change.To.Name:
 		return "renamed"
 	default:
 		return "modified"
@@ -742,7 +829,13 @@ func countChunkLines(filePatch fdiff.FilePatch, kind fdiff.Operation) int {
 	count := 0
 	for _, chunk := range filePatch.Chunks() {
 		if chunk.Type() == kind {
-			count += strings.Count(chunk.Content(), "\n")
+			content := chunk.Content()
+			count += strings.Count(content, "\n")
+			// The last line of a chunk may lack a trailing newline, and it is
+			// still a changed line.
+			if content != "" && !strings.HasSuffix(content, "\n") {
+				count++
+			}
 		}
 	}
 	return count

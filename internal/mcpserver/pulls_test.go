@@ -185,7 +185,7 @@ func TestGetPullRequestDiffPassesExplicitBaseRef(t *testing.T) {
 func TestPullToolErrorsSurfaceAsToolErrors(t *testing.T) {
 	session := connectTestClient(t, &fakeClient{
 		listPullsErr: &gogs.Error{Code: gogs.CodeAuthenticationFailed, Message: "Git authentication failed."},
-		getPullErr:   &gogs.Error{Code: gogs.CodeInvalidArgument, Message: "Issue #3 has no pull request head ref and is not a pull request."},
+		getPullErr:   &gogs.Error{Code: gogs.CodeInvalidArgument, Message: "Number 3 has no pull request head ref and is not a pull request."},
 	})
 
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{

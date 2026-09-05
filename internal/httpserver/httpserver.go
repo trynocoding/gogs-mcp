@@ -28,6 +28,7 @@ import (
 const (
 	defaultServerEndpoint     = "/mcp"
 	defaultServerTokenHeader  = "Authorization"
+	healthzEndpoint           = "/healthz"
 	defaultUserCacheTTL       = 5 * time.Minute
 	defaultMaxUsers           = 128
 	minUserCacheTTL           = time.Second
@@ -102,6 +103,13 @@ func New(options Options) (*Server, error) {
 	if options.Endpoint == "" {
 		options.Endpoint = defaultServerEndpoint
 	}
+	// config.Load rejects the same value, but New owns the mux registration
+	// and can be built without going through the config, so the reservation
+	// is repeated here: a duplicate /healthz registration would only surface
+	// as a ServeMux panic on the first request.
+	if options.Endpoint == healthzEndpoint {
+		return nil, errors.Newf("the endpoint %q is reserved for the unauthenticated health probe", options.Endpoint)
+	}
 	if options.TokenHeader == "" {
 		options.TokenHeader = defaultServerTokenHeader
 	}
@@ -163,7 +171,7 @@ func (s *Server) Handler() http.Handler {
 		Logger:       s.baseLogger,
 	})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc(healthzEndpoint, s.handleHealthz)
 	mux.Handle(s.options.Endpoint, s.withAccessLog(s.withAuthentication(streamable)))
 	return mux
 }

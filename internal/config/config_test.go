@@ -285,6 +285,7 @@ func TestLoadRejectsInvalidHTTPSettings(t *testing.T) {
 		"endpoint_relative":      {"GOGS_MCP_HTTP_ENDPOINT", "mcp"},
 		"endpoint_root":          {"GOGS_MCP_HTTP_ENDPOINT", "/"},
 		"endpoint_traversal":     {"GOGS_MCP_HTTP_ENDPOINT", "/a/../mcp"},
+		"endpoint_reserved":      {"GOGS_MCP_HTTP_ENDPOINT", "/healthz"},
 		"header_invalid_chars":   {"GOGS_MCP_HTTP_TOKEN_HEADER", "X Gogs Token"},
 		"header_reserved_host":   {"GOGS_MCP_HTTP_TOKEN_HEADER", "Host"},
 		"header_reserved_case":   {"GOGS_MCP_HTTP_TOKEN_HEADER", "mcp-session-id"},

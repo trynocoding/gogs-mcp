@@ -536,6 +536,9 @@ var e2eToolNames = []string{
 	"get_branch",
 	"list_commits",
 	"get_commit",
+	"list_pull_requests",
+	"get_pull_request",
+	"get_pull_request_diff",
 	"search_code",
 	"list_issues",
 	"get_issue",
@@ -579,6 +582,12 @@ func useMCPClientCommand(t *testing.T, command *exec.Cmd, token string, expected
 	t.Helper()
 	var stderr bytes.Buffer
 	defer func() {
+		// A stdio server that dies mid-session surfaces as EOF on the next
+		// call; its stderr is the only crash evidence, so it is logged with
+		// the token redacted before assertNoSecrets re-checks it.
+		if t.Failed() {
+			t.Logf("The MCP server stderr:\n%s", strings.ReplaceAll(stderr.String(), token, "<redacted>"))
+		}
 		assertNoSecrets(t, stderr.Bytes(), token)
 	}()
 	command.Stderr = &stderr

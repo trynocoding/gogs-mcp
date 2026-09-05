@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"gogs-mcp/internal/gogs"
 	"gogs-mcp/internal/mcpserver"
 	"gogs-mcp/internal/securelog"
+
+	"github.com/cockroachdb/errors"
 )
 
 // userEntry is one resolved Gogs user with the tool server built for it. The
@@ -227,8 +230,21 @@ func (s *Server) buildUser(ctx context.Context, token, hash string) (*userEntry,
 // buildUserEntry assembles the per-user Gogs client, logger, and tool
 // server. The pull request cache lives under cacheRoot/users/<userID> so
 // that users never share extracted content, matching the snapshot cache.
+// The whole fixed chain is private to the server process (0700): MkdirAll
+// creates missing ancestors with that mode, but directories an older
+// version created keep their looser mode, so every ancestor is tightened as
+// well.
 func (s *Server) buildUserEntry(token, hash string, user gogs.User) (*userEntry, error) {
 	userRoot := filepath.Join(s.options.CacheRoot, "users", strconv.FormatInt(user.ID, 10))
+	if err := os.MkdirAll(userRoot, 0o700); err != nil {
+		return nil, errors.Wrap(err, "create user cache root")
+	}
+	usersRoot := filepath.Join(s.options.CacheRoot, "users")
+	for _, path := range []string{s.options.CacheRoot, usersRoot, userRoot} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			return nil, errors.Wrap(err, "tighten cache directory")
+		}
+	}
 	logger := securelog.NewRedactingLogger(s.options.LogDestination, s.options.LogLevel, token, "token "+token).
 		With("user_id", user.ID, "username", user.Username)
 	client, err := s.newClient(token, userRoot, logger)

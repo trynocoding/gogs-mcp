@@ -278,8 +278,10 @@ func assertRepositoryRefs(t *testing.T, refs repositoryRefs) {
 	t.Helper()
 	assert.Equal(t, "main", refs.DefaultBranch)
 	assert.Equal(t, "feature/content", refs.FeatureBranch)
+	assert.Equal(t, "release/v1.0", refs.ReleaseBranch)
 	assert.Equal(t, "v1.0.0", refs.Tag)
 	assert.Len(t, refs.MainCommitSHA, 40)
 	assert.Len(t, refs.FeatureSHA, 40)
 	assert.Len(t, refs.TagSHA, 40)
+	assert.Len(t, refs.PullSHA, 40)
 }

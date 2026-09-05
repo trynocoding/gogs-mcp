@@ -259,8 +259,10 @@ func (c *Client) pullHeadRef(ctx context.Context, owner, repo string, number int
 	index := slices.IndexFunc(refs, func(ref PullRef) bool { return ref.Number == number })
 	if index < 0 {
 		return PullRef{}, &Error{
-			Code:    CodeInvalidArgument,
-			Message: fmt.Sprintf("Issue #%d has no pull request head ref and is not a pull request.", number),
+			Code: CodeInvalidArgument,
+			// The wording avoids claiming that an issue with this number
+			// exists: on an empty repository, no issue and no pull ref does.
+			Message: fmt.Sprintf("Number %d has no pull request head ref and is not a pull request.", number),
 		}
 	}
 	return refs[index], nil

@@ -114,13 +114,15 @@ func TestGit(t *testing.T) {
 		branches := callBranchPage(t, session, map[string]any{
 			"owner": "owner", "repo": bootstrap.SharedRepository,
 		})
-		require.Len(t, branches.Data.Branches, 2)
+		require.Len(t, branches.Data.Branches, 3)
 		assert.Equal(t, "feature/content", branches.Data.Branches[0].Name)
 		assert.Equal(t, bootstrap.Refs.FeatureSHA, branches.Data.Branches[0].HeadSHA)
 		assert.Equal(t, "main", branches.Data.Branches[1].Name)
 		assert.Equal(t, bootstrap.Refs.MainCommitSHA, branches.Data.Branches[1].HeadSHA)
+		assert.Equal(t, "release/v1.0", branches.Data.Branches[2].Name)
+		assert.Equal(t, bootstrap.Refs.TagSHA, branches.Data.Branches[2].HeadSHA)
 		assert.Equal(t, 1, branches.Data.Page)
-		assert.Equal(t, 2, branches.Data.Total)
+		assert.Equal(t, 3, branches.Data.Total)
 		assert.NotEmpty(t, branches.Meta.RequestID)
 
 		featureBranch := callBranch(t, session, map[string]any{

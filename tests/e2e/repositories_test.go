@@ -34,10 +34,12 @@ type repositoryBootstrapResult struct {
 type repositoryRefs struct {
 	DefaultBranch string `json:"default_branch"`
 	FeatureBranch string `json:"feature_branch"`
+	ReleaseBranch string `json:"release_branch"`
 	Tag           string `json:"tag"`
 	MainCommitSHA string `json:"main_commit_sha"`
 	FeatureSHA    string `json:"feature_sha"`
 	TagSHA        string `json:"tag_sha"`
+	PullSHA       string `json:"pull_sha"`
 }
 
 type repositoryPermissions struct {

@@ -507,6 +507,12 @@ func validateHTTPSettings(cfg *Config) error {
 	if !strings.HasPrefix(cfg.HTTPEndpoint, "/") || cfg.HTTPEndpoint == "/" || path.Clean(cfg.HTTPEndpoint) != cfg.HTTPEndpoint {
 		return errors.Newf("GOGS_MCP_HTTP_ENDPOINT %q must be one absolute request path", cfg.HTTPEndpoint)
 	}
+	// The http handler registers /healthz as an unauthenticated probe before
+	// the configured endpoint, and a duplicate ServeMux registration panics;
+	// the reserved path is therefore rejected with a readable error here.
+	if cfg.HTTPEndpoint == "/healthz" {
+		return errors.Newf("GOGS_MCP_HTTP_ENDPOINT %q is reserved for the unauthenticated health probe", cfg.HTTPEndpoint)
+	}
 	if !isValidHeaderName(cfg.HTTPTokenHeader) || reservedHeader(cfg.HTTPTokenHeader) {
 		return errors.Newf("GOGS_MCP_HTTP_TOKEN_HEADER %q is not usable as a credential header", cfg.HTTPTokenHeader)
 	}

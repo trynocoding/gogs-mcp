@@ -58,7 +58,9 @@ func buildPullFixture(t *testing.T) (*url.URL, plumbing.Hash, plumbing.Hash) {
 	require.NoError(t, os.Remove(filepath.Join(dir, "old.txt")))
 	_, err = worktree.Remove("old.txt")
 	require.NoError(t, err)
-	writeFile("new.txt", "arrives\n")
+	// The content lacks a trailing newline on purpose: the added line must
+	// still count as one addition.
+	writeFile("new.txt", "arrives")
 	headHash, err := worktree.Commit("Pull change", &git.CommitOptions{Author: signature, AllowEmptyCommits: true})
 	require.NoError(t, err)
 
@@ -87,6 +89,78 @@ func TestListPullRefsFindsPullHeads(t *testing.T) {
 	require.Len(t, refs, 1)
 	assert.Equal(t, int64(1), refs[0].Number)
 	assert.Equal(t, headHash.String(), refs[0].HeadSHA)
+}
+
+func TestListPullRefsReturnsEmptyForEmptyRepository(t *testing.T) {
+	emptyDir := t.TempDir()
+	_, err := git.PlainInit(emptyDir, false)
+	require.NoError(t, err)
+	engine := newTestPullEngine(t)
+
+	refs, err := engine.ListPullRefs(context.Background(), &url.URL{Scheme: "file", Path: emptyDir})
+	require.NoError(t, err)
+	assert.Empty(t, refs)
+}
+
+func TestListPullRefsOrdersPullHeads(t *testing.T) {
+	fixtureURL, mainHash, headHash := buildPullFixture(t)
+	repo, err := git.PlainOpen(fixtureURL.Path)
+	require.NoError(t, err)
+	// Seed extra heads out of order, including the lexicographic trap of a
+	// two-digit number.
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.ReferenceName("refs/pull/10/head"), headHash)))
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.ReferenceName("refs/pull/2/head"), mainHash)))
+	engine := newTestPullEngine(t)
+
+	refs, err := engine.ListPullRefs(context.Background(), fixtureURL)
+	require.NoError(t, err)
+	numbers := make([]int64, 0, len(refs))
+	for _, ref := range refs {
+		numbers = append(numbers, ref.Number)
+	}
+	assert.Equal(t, []int64{1, 2, 10}, numbers)
+}
+
+func TestDiffPullReportsRenameUnderNewPath(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+
+	signature := &object.Signature{Name: "Reader", Email: "reader@example.com", When: time.Now()}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "old.txt"), []byte("rename me\n"), 0o644))
+	_, err = worktree.Add("old.txt")
+	require.NoError(t, err)
+	_, err = worktree.Commit("Before rename", &git.CommitOptions{Author: signature})
+	require.NoError(t, err)
+	// go-git initializes HEAD to master; align the fixture with the base ref
+	// the test fetches.
+	require.NoError(t, worktree.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName("main"),
+		Create: true,
+	}))
+	require.NoError(t, worktree.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName("pr-branch"),
+		Create: true,
+	}))
+	_, err = worktree.Move("old.txt", "new.txt")
+	require.NoError(t, err)
+	headHash, err := worktree.Commit("Rename old.txt", &git.CommitOptions{Author: signature})
+	require.NoError(t, err)
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.ReferenceName("refs/pull/1/head"), headHash)))
+	engine := newTestPullEngine(t)
+
+	diff, err := engine.DiffPull(context.Background(), &url.URL{Scheme: "file", Path: dir}, 1, "main", nil, 0)
+	require.NoError(t, err)
+	require.Len(t, diff.Files, 1)
+	// The stat carries the new path, matching the filter matching and the
+	// b/ side of the diff header.
+	assert.Equal(t, "new.txt", diff.Files[0].Path)
+	assert.Equal(t, "renamed", diff.Files[0].Status)
 }
 
 func TestDiffPullProducesStandardUnifiedDiff(t *testing.T) {
@@ -148,6 +222,58 @@ func TestDiffPullRejectsBadArguments(t *testing.T) {
 	assert.Equal(t, CodeInvalidArgument, AsError(err).Code)
 }
 
+func TestDiffPullRejectsRepositoryAboveCacheLimit(t *testing.T) {
+	fixtureURL, _, _ := buildPullFixture(t)
+	engine, err := NewPullEngine(PullEngineOptions{
+		CacheDir:      t.TempDir(),
+		CacheMaxBytes: 1, // even the smallest fixture fetches more than one byte
+	})
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	diff, err := engine.DiffPull(ctx, fixtureURL, 1, "main", nil, 0)
+	require.Error(t, err)
+	assert.Nil(t, diff)
+	assert.Equal(t, CodeCacheCapacityExceeded, AsError(err).Code)
+	assert.True(t, AsError(err).Retryable, "raising the limit must make the call retryable")
+
+	// The oversized repository must not linger until the next call.
+	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
+	require.NoError(t, err)
+	assert.Empty(t, entries, "a repository above the limit must not be cached")
+}
+
+func TestDiffPullKeepsAggregateWithinCacheLimit(t *testing.T) {
+	urlA, _, _ := buildPullFixture(t)
+	urlB, _, _ := buildPullFixture(t)
+	ctx := context.Background()
+
+	// The probe measures the fixture sizes, so the limit below fits either
+	// repository alone but not both together.
+	probe := newTestPullEngine(t)
+	_, err := probe.DiffPull(ctx, urlA, 1, "main", nil, 0)
+	require.NoError(t, err)
+	_, err = probe.DiffPull(ctx, urlB, 1, "main", nil, 0)
+	require.NoError(t, err)
+	limit := max(dirSize(probe.repoPathFor(urlA)), dirSize(probe.repoPathFor(urlB)))
+
+	engine, err := NewPullEngine(PullEngineOptions{CacheDir: t.TempDir(), CacheMaxBytes: limit})
+	require.NoError(t, err)
+
+	_, err = engine.DiffPull(ctx, urlA, 1, "main", nil, 0)
+	require.NoError(t, err)
+	// Fetching B pushes the total above the limit; the older repository A
+	// must be evicted instead of breaching the bound.
+	_, err = engine.DiffPull(ctx, urlB, 1, "main", nil, 0)
+	require.NoError(t, err)
+
+	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the cache must keep only the freshly fetched repository")
+	assert.Equal(t, filepath.Base(engine.repoPathFor(urlB)), entries[0].Name())
+	assert.LessOrEqual(t, dirSize(filepath.Join(engine.cacheDir, "pull")), limit)
+}
+
 func TestDiffPullReusesCacheRepository(t *testing.T) {
 	fixtureURL, _, _ := buildPullFixture(t)
 	engine, err := NewPullEngine(PullEngineOptions{CacheDir: t.TempDir()})
@@ -171,6 +297,39 @@ func TestDiffPullReusesCacheRepository(t *testing.T) {
 	entries, err = os.ReadDir(engine.cacheDir)
 	require.NoError(t, err)
 	assert.Empty(t, entries)
+}
+
+func TestDiffPullCreatesPrivateCacheRepository(t *testing.T) {
+	fixtureURL, _, _ := buildPullFixture(t)
+	engine := newTestPullEngine(t)
+
+	_, err := engine.DiffPull(context.Background(), fixtureURL, 1, "main", nil, 0)
+	require.NoError(t, err)
+
+	repoPath := engine.repoPathFor(fixtureURL)
+	info, err := os.Stat(repoPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(),
+		"the cache repository holds fetched repository objects and must be private")
+}
+
+func TestDiffPullTightensLegacyCachePermissions(t *testing.T) {
+	fixtureURL, _, _ := buildPullFixture(t)
+	engine := newTestPullEngine(t)
+	ctx := context.Background()
+
+	_, err := engine.DiffPull(ctx, fixtureURL, 1, "main", nil, 0)
+	require.NoError(t, err)
+	repoPath := engine.repoPathFor(fixtureURL)
+	// Imitate a repository created before the cache became private; an
+	// actively used repository never ages out through the TTL sweep.
+	require.NoError(t, os.Chmod(repoPath, 0o755))
+
+	_, err = engine.DiffPull(ctx, fixtureURL, 1, "main", nil, 0)
+	require.NoError(t, err)
+	info, err := os.Stat(repoPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
 }
 
 func TestParsePullRef(t *testing.T) {
