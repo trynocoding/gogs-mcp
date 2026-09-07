@@ -57,6 +57,7 @@ func TestGetFileDefaultsToTwoHundredLinesAndReturnsContinuation(t *testing.T) {
 	response := callFile(t, session, map[string]any{"owner": "owner", "repo": "project", "path": "src/lines.txt"})
 
 	assert.Equal(t, "text", response.Data.Type)
+	assert.True(t, response.Data.TrailingNewline)
 	assert.Equal(t, 1, response.Data.StartLine)
 	assert.Equal(t, 200, response.Data.EndLine)
 	assert.Equal(t, 250, response.Data.TotalLines)
@@ -83,6 +84,8 @@ func TestGetFileReturnsRequestedUnicodeLineRange(t *testing.T) {
 	})
 
 	assert.Equal(t, "你好，世界\nemoji 😀", response.Data.Content)
+	// The flag describes the file, not the returned range.
+	assert.True(t, response.Data.TrailingNewline)
 	assert.Equal(t, 2, response.Data.StartLine)
 	assert.Equal(t, 3, response.Data.EndLine)
 	assert.Equal(t, 4, response.Data.TotalLines)
@@ -90,6 +93,37 @@ func TestGetFileReturnsRequestedUnicodeLineRange(t *testing.T) {
 	require.NotNil(t, response.Meta.NextStartLine)
 	assert.Equal(t, 4, *response.Meta.NextStartLine)
 	assert.Equal(t, "v1.0.0", client.contentRef)
+}
+
+func TestGetFileDistinguishesFilesByTrailingNewline(t *testing.T) {
+	testCases := []struct {
+		name       string
+		data       string
+		content    string
+		totalLines int
+		present    bool
+	}{
+		{name: "with trailing newline", data: "a\nb\n", content: "a\nb", totalLines: 2, present: true},
+		{name: "without trailing newline", data: "a\nb", content: "a\nb", totalLines: 2, present: false},
+		{name: "empty file", data: "", content: "", totalLines: 0, present: false},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := &fakeClient{file: gogs.FileContent{
+				Path: "lines.txt", Type: "file", Size: int64(len(testCase.data)), SHA: "sha", Ref: "main", Data: []byte(testCase.data),
+			}}
+			session := connectTestClient(t, client)
+
+			response := callFile(t, session, map[string]any{"owner": "owner", "repo": "project", "path": "lines.txt"})
+
+			assert.Equal(t, testCase.content, response.Data.Content)
+			assert.Equal(t, testCase.totalLines, response.Data.TotalLines)
+			assert.Equal(t, testCase.present, response.Data.TrailingNewline)
+			encoded, err := json.Marshal(response.Data)
+			require.NoError(t, err)
+			assert.Equal(t, testCase.present, strings.Contains(string(encoded), `"trailing_newline":true`))
+		})
+	}
 }
 
 func TestGetFileReturnsBinaryMetadataWithoutPayload(t *testing.T) {
@@ -101,6 +135,7 @@ func TestGetFileReturnsBinaryMetadataWithoutPayload(t *testing.T) {
 	response := callFile(t, session, map[string]any{"owner": "owner", "repo": "project", "path": "image.bin"})
 
 	assert.Equal(t, "binary", response.Data.Type)
+	assert.False(t, response.Data.TrailingNewline)
 	assert.Equal(t, int64(5), response.Data.Size)
 	assert.Equal(t, "binary-sha", response.Data.SHA)
 	assert.Empty(t, response.Data.Content)

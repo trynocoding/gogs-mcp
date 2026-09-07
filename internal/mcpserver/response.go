@@ -86,6 +86,10 @@ type File struct {
 	TotalLines   int    `json:"total_lines,omitempty"`
 	Target       string `json:"target,omitempty"`
 	SubmoduleURL string `json:"submodule_url,omitempty"`
+	// TrailingNewline reports whether the file itself ends with a newline
+	// byte; the content lines are joined without one, so callers that need
+	// the exact bytes append "\n" when this is true.
+	TrailingNewline bool `json:"trailing_newline,omitempty"`
 }
 
 type Branch struct {

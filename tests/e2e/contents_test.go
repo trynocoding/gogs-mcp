@@ -43,17 +43,18 @@ type directoryPage struct {
 }
 
 type fileContent struct {
-	Path         string `json:"path"`
-	Ref          string `json:"ref"`
-	Type         string `json:"type"`
-	Size         int64  `json:"size"`
-	SHA          string `json:"sha"`
-	Content      string `json:"content,omitempty"`
-	StartLine    int    `json:"start_line,omitempty"`
-	EndLine      int    `json:"end_line,omitempty"`
-	TotalLines   int    `json:"total_lines,omitempty"`
-	Target       string `json:"target,omitempty"`
-	SubmoduleURL string `json:"submodule_url,omitempty"`
+	Path            string `json:"path"`
+	Ref             string `json:"ref"`
+	Type            string `json:"type"`
+	Size            int64  `json:"size"`
+	SHA             string `json:"sha"`
+	Content         string `json:"content,omitempty"`
+	StartLine       int    `json:"start_line,omitempty"`
+	EndLine         int    `json:"end_line,omitempty"`
+	TotalLines      int    `json:"total_lines,omitempty"`
+	Target          string `json:"target,omitempty"`
+	SubmoduleURL    string `json:"submodule_url,omitempty"`
+	TrailingNewline bool   `json:"trailing_newline,omitempty"`
 }
 
 type contentResponse[T any] struct {
@@ -152,6 +153,8 @@ func TestContents(t *testing.T) {
 		})
 		assert.Equal(t, "你好，Gogs\nemoji 😀", unicode.Data.Content)
 		assert.Equal(t, 2, unicode.Data.TotalLines)
+		// The fixtures are written with a trailing newline.
+		assert.True(t, unicode.Data.TrailingNewline)
 
 		firstLines := callContentFile(t, session, map[string]any{
 			"owner": "owner", "repo": bootstrap.SharedRepository, "path": "src/lines.txt",

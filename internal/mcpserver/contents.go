@@ -156,6 +156,9 @@ func boundedFile(content gogs.FileContent, startLine, lineCount int) (File, Resp
 	}
 
 	file.Type = "text"
+	// splitTextLines drops the empty element after a trailing newline, so
+	// that fact is reported separately to keep the original bytes recoverable.
+	file.TrailingNewline = bytes.HasSuffix(content.Data, []byte("\n"))
 	lines := splitTextLines(content.Data)
 	file.TotalLines = len(lines)
 	if startLine > len(lines) {
