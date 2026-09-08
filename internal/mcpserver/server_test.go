@@ -233,11 +233,11 @@ func (c *fakeClient) CreateIssueComment(_ context.Context, _, _ string, number i
 	return c.createdComment, c.createCommentErr
 }
 
-func (c *fakeClient) ListPullRequests(_ context.Context, _, _, state string, limit int) ([]gogs.PullRequestSummary, int, error) {
+func (c *fakeClient) ListPullRequests(_ context.Context, _, _, state string, limit int, _ int64) ([]gogs.PullRequestSummary, int, int64, error) {
 	c.listPullsCalls++
 	c.listPullsState = state
 	c.listPullsLimit = limit
-	return c.pullSummaries, c.pullTotal, c.listPullsErr
+	return c.pullSummaries, c.pullTotal, 0, c.listPullsErr
 }
 
 func (c *fakeClient) GetPullRequest(_ context.Context, _, _ string, number int64) (gogs.PullRequest, error) {
@@ -414,4 +414,17 @@ func decodeStructuredContent(t *testing.T, source, destination any) {
 	encoded, err := json.Marshal(source)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(encoded, destination))
+}
+
+func (c *fakeClient) ListDirectoryPage(ctx context.Context, owner, repo, path, ref string, page, perPage int) ([]gogs.ContentEntry, string, int, error) {
+	entries, usedRef, err := c.ListDirectory(ctx, owner, repo, path, ref)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	result := paginateDirectory(entries, path, usedRef, page, perPage)
+	selected := make([]gogs.ContentEntry, 0, len(result.Entries))
+	for _, e := range result.Entries {
+		selected = append(selected, gogs.ContentEntry{Name: e.Name, Path: e.Path, Type: e.Type, Size: e.Size, SHA: e.SHA, Target: e.Target, SubmoduleURL: e.SubmoduleURL})
+	}
+	return selected, usedRef, len(entries), nil
 }

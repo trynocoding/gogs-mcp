@@ -1,9 +1,11 @@
 package mcpserver
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
-	"strconv"
+	"fmt"
+	"slices"
 	"unicode/utf8"
 
 	"gogs-mcp/internal/gogs"
@@ -31,17 +33,23 @@ type listIssuesInput struct {
 }
 
 type getIssueInput struct {
-	Owner  string `json:"owner"`
-	Repo   string `json:"repo"`
-	Number int64  `json:"number"`
+	BodyOffset   int    `json:"body_offset,omitempty"`
+	BodyMaxBytes int    `json:"body_max_bytes,omitempty"`
+	Owner        string `json:"owner"`
+	Repo         string `json:"repo"`
+	Number       int64  `json:"number"`
 }
 
 type listIssueCommentsInput struct {
-	Owner       string `json:"owner"`
-	Repo        string `json:"repo"`
-	Number      int64  `json:"number"`
-	Since       string `json:"since,omitempty"`
-	MaxComments int    `json:"max_comments,omitempty"`
+	AfterID      int64  `json:"after_id,omitempty"`
+	CommentID    int64  `json:"comment_id,omitempty"`
+	BodyOffset   int    `json:"body_offset,omitempty"`
+	BodyMaxBytes int    `json:"body_max_bytes,omitempty"`
+	Owner        string `json:"owner"`
+	Repo         string `json:"repo"`
+	Number       int64  `json:"number"`
+	Since        string `json:"since,omitempty"`
+	MaxComments  int    `json:"max_comments,omitempty"`
 }
 
 type createIssueInput struct {
@@ -125,10 +133,16 @@ func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 			result, response := issueError(requestID, err)
 			return result, response, nil
 		}
+		if err := validateBodyOffset(issue.Body, input.BodyOffset); err != nil {
+			result, response := issueError(requestID, err)
+			return result, response, nil
+		}
 		output := mapIssue(issue)
+		meta := ResponseMeta{RequestID: requestID}
+		boundBody(&output.Body, input.BodyOffset, input.BodyMaxBytes, &meta)
 		return nil, ToolResponse[Issue]{
 			Data: &output,
-			Meta: ResponseMeta{RequestID: requestID},
+			Meta: meta,
 		}, nil
 	})
 
@@ -145,23 +159,54 @@ func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 			result, response := issueCommentPageError(requestID, toolErr)
 			return result, response, nil
 		}
+		if input.BodyOffset > 0 && input.CommentID == 0 {
+			result, response := issueCommentPageError(requestID, &gogs.Error{Code: gogs.CodeInvalidArgument, Message: "body_offset requires comment_id."})
+			return result, response, nil
+		}
 		comments, err := client.ListIssueComments(ctx, input.Owner, input.Repo, input.Number, query.since)
 		if err != nil {
 			result, response := issueCommentPageError(requestID, err)
 			return result, response, nil
 		}
 
+		comments = slices.Clone(comments)
+		slices.SortFunc(comments, func(a, b gogs.IssueComment) int { return cmp.Compare(a.ID, b.ID) })
+		filtered := make([]gogs.IssueComment, 0, len(comments))
+		for _, comment := range comments {
+			if comment.ID > input.AfterID && (input.CommentID == 0 || comment.ID == input.CommentID) {
+				filtered = append(filtered, comment)
+			}
+		}
+		comments = filtered
 		meta := ResponseMeta{RequestID: requestID}
-		if len(comments) > query.maxComments {
-			comments = comments[:query.maxComments]
-			meta.Truncated = true
-			meta.Warnings = append(meta.Warnings, "The comment list stopped at the max_comments limit of "+strconv.Itoa(query.maxComments)+".")
+		mapped := mapIssueComments(comments)
+		for i := range mapped {
+			offset, maximum := 0, 256
+			if input.CommentID > 0 {
+				if err := validateBodyOffset(mapped[i].Body, input.BodyOffset); err != nil {
+					result, response := issueCommentPageError(requestID, err)
+					return result, response, nil
+				}
+				offset = input.BodyOffset
+				maximum = input.BodyMaxBytes
+			}
+			mapped[i].Body, mapped[i].NextBodyOffset = bodyChunk(mapped[i].Body, offset, maximum)
+			if mapped[i].NextBodyOffset != nil {
+				meta.Truncated = true
+			}
 		}
-		selected, dropped := commentsWithin(mapIssueComments(comments), maximumFileTextBytes)
-		if dropped {
-			meta.Truncated = true
-			meta.Warnings = append(meta.Warnings, "Comments reached the 64 KiB structured output limit.")
+		if len(mapped) > query.maxComments {
+			meta.Warnings = append(meta.Warnings, fmt.Sprintf("The comment list stopped at the max_comments limit of %d.", query.maxComments))
 		}
+		selected, dropped := commentsWithin(mapped[:min(len(mapped), query.maxComments)], maximumFileTextBytes)
+		if len(selected) < len(mapped) && len(selected) > 0 {
+			meta.NextAfterID = selected[len(selected)-1].ID
+			meta.Truncated = true
+		}
+		if dropped || meta.Truncated {
+			meta.Warnings = append(meta.Warnings, "Comments are partial. Use after_id=next_after_id for more comments; use comment_id and body_offset for a comment's remaining body.")
+		}
+
 		output := IssueCommentPage{
 			Comments: selected,
 			Since:    input.Since,
@@ -195,9 +240,11 @@ func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 			return result, response, nil
 		}
 		output := mapIssue(issue)
+		meta := ResponseMeta{RequestID: requestID}
+		boundBody(&output.Body, 0, 0, &meta)
 		return nil, ToolResponse[Issue]{
 			Data: &output,
-			Meta: ResponseMeta{RequestID: requestID},
+			Meta: meta,
 		}, nil
 	})
 
@@ -220,9 +267,11 @@ func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 			return result, response, nil
 		}
 		output := mapIssue(issue)
+		meta := ResponseMeta{RequestID: requestID}
+		boundBody(&output.Body, 0, 0, &meta)
 		return nil, ToolResponse[Issue]{
 			Data: &output,
-			Meta: ResponseMeta{RequestID: requestID},
+			Meta: meta,
 		}, nil
 	})
 
@@ -244,9 +293,12 @@ func registerIssueTools(server *mcp.Server, client Client, writeEnabled bool) {
 			return result, response, nil
 		}
 		output := mapIssueComment(comment)
+		meta := ResponseMeta{RequestID: requestID}
+		boundBody(&output.Body, 0, 0, &meta)
+		output.NextBodyOffset = meta.NextBodyOffset
 		return nil, ToolResponse[IssueComment]{
 			Data: &output,
-			Meta: ResponseMeta{RequestID: requestID},
+			Meta: meta,
 		}, nil
 	})
 }
@@ -630,24 +682,22 @@ func listIssuesInputSchema() *jsonschema.Schema {
 }
 
 func getIssueInputSchema() *jsonschema.Schema {
-	return objectSchema(map[string]*jsonschema.Schema{
-		"owner":  stringSchema("Repository owner username.", true, false),
-		"repo":   stringSchema("Repository name.", true, false),
-		"number": integerSchema("Issue number.", 1, 0),
-	}, []string{"owner", "repo", "number"})
+	properties := repositoryIdentityProperties()
+	properties["number"] = integerSchema("Issue number.", 1, 0)
+	bodyRangeProperties(properties)
+	return objectSchema(properties, []string{"owner", "repo", "number"})
 }
-
 func listIssueCommentsInputSchema() *jsonschema.Schema {
-	return objectSchema(map[string]*jsonschema.Schema{
-		"owner":  stringSchema("Repository owner username.", true, false),
-		"repo":   stringSchema("Repository name.", true, false),
-		"number": integerSchema("Issue number.", 1, 0),
-		"since": {
-			Type:        "string",
-			Description: "Only return comments created at or after this RFC3339 timestamp, for example 2024-01-02T15:04:05Z.",
-		},
-		"max_comments": integerSchema("Maximum number of comments to return, from 1 through 500. Defaults to 100.", defaultMaxComments, maximumMaxComments),
-	}, []string{"owner", "repo", "number"})
+	properties := repositoryIdentityProperties()
+	properties["number"] = integerSchema("Issue number.", 1, 0)
+	properties["since"] = &jsonschema.Schema{Type: "string", Description: "Only return comments created at or after this RFC3339 timestamp."}
+	properties["max_comments"] = integerSchema("Maximum comments to return.", defaultMaxComments, maximumMaxComments)
+	properties["after_id"] = integerSchema("Continue after meta.next_after_id.", 1, 0)
+	properties["comment_id"] = integerSchema("Read one comment's body; combine with body_offset to continue.", 1, 0)
+	properties["after_id"].Default = nil
+	properties["comment_id"].Default = nil
+	bodyRangeProperties(properties)
+	return objectSchema(properties, []string{"owner", "repo", "number"})
 }
 
 func createIssueInputSchema() *jsonschema.Schema {

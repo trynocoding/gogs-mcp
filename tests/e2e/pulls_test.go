@@ -272,7 +272,10 @@ func TestPulls(t *testing.T) {
 			"owner": "owner", "repo": bootstrap.SharedRepository, "number": 1,
 		})
 	})
-	pullRoot := filepath.Join(cacheDir, "pull")
+	roots, err := filepath.Glob(filepath.Join(cacheDir, "*", "*", ".pull"))
+	require.NoError(t, err)
+	require.Len(t, roots, 1)
+	pullRoot := roots[0]
 	entries, err := os.ReadDir(pullRoot)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)

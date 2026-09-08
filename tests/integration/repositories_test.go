@@ -52,16 +52,23 @@ func TestRepositoryToolsUseGogsV0142Contracts(t *testing.T) {
 		case "/api/v1/repos/owner/missing":
 			state.detailRequests.Add(1)
 			http.Error(writer, "not found", http.StatusNotFound)
-		case "/api/v1/repos/owner/private-shared/contents/src":
+		case "/api/v1/repos/owner/private-shared/branches/trunk":
+			writeJSON(t, writer, `{"commit":{"id":"`+strings.Repeat("a", 40)+`"}}`)
+		case "/api/v1/repos/owner/private-shared/branches/v1.0.0":
+			http.NotFound(writer, request)
+		case "/api/v1/repos/owner/private-shared/tags":
+			writeJSON(t, writer, `[{"name":"v1.0.0","commit":{"id":"`+strings.Repeat("a", 40)+`"}}]`)
+		case "/api/v1/repos/owner/private-shared/git/trees/" + strings.Repeat("a", 40):
+			writeJSON(t, writer, `{"tree":[{"type":"tree","path":"src","sha":"subtree"}]}`)
+		case "/api/v1/repos/owner/private-shared/git/trees/subtree":
+			writeJSON(t, writer, `{"tree":[{"type":"blob","path":"link","sha":"link-sha","size":11},{"type":"blob","path":"version.txt","sha":"version-sha","size":19}]}`)
+		case "/api/v1/repos/owner/private-shared/contents/src/link":
 			state.contentRequests.Add(1)
-			assert.Equal(t, "trunk", request.URL.Query().Get("ref"))
-			writeJSON(t, writer, `[
-				{"type":"symlink","size":11,"name":"link","path":"src/link","sha":"link-sha","target":"version.txt"},
-				{"type":"file","size":17,"name":"version.txt","path":"src/version.txt","sha":"version-sha"}
-			]`)
+			assert.Equal(t, strings.Repeat("a", 40), request.URL.Query().Get("ref"))
+			writeJSON(t, writer, `{"type":"symlink","size":11,"name":"link","path":"src/link","sha":"link-sha","target":"version.txt"}`)
 		case "/api/v1/repos/owner/private-shared/contents/src/version.txt":
 			state.contentRequests.Add(1)
-			assert.Equal(t, "v1.0.0", request.URL.Query().Get("ref"))
+			assert.Equal(t, strings.Repeat("a", 40), request.URL.Query().Get("ref"))
 			encoded := base64.StdEncoding.EncodeToString([]byte("first\n你好\nthird\n"))
 			writeJSON(t, writer, fmt.Sprintf(`{"type":"file","encoding":"base64","size":19,"name":"version.txt","path":"src/version.txt","sha":"version-sha","content":%q}`, encoded))
 		default:
@@ -136,7 +143,7 @@ func TestRepositoryToolsUseGogsV0142Contracts(t *testing.T) {
 
 	assert.Equal(t, int32(2), state.listRequests.Load())
 	assert.Equal(t, int32(3), state.detailRequests.Load())
-	assert.Equal(t, int32(2), state.contentRequests.Load())
+	assert.Equal(t, int32(3), state.contentRequests.Load())
 }
 
 func connect(t *testing.T, apiRoot, token string) *mcp.ClientSession {

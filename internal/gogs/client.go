@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"gogs-mcp/internal/snapshot"
+
 	"github.com/cockroachdb/errors"
 )
 
@@ -29,6 +31,8 @@ type Options struct {
 	// CacheDir hosts the git object cache of the pull request engine. When
 	// empty, the pull request tools are unavailable.
 	CacheDir string
+	// Snapshots supplies the shared instance/user cache namespace.
+	Snapshots *snapshot.Manager
 	// CacheTTL and CacheMaxBytes bound the pull request diff cache; the
 	// engine falls back to its own defaults for non-positive values.
 	CacheTTL      time.Duration
@@ -37,14 +41,17 @@ type Options struct {
 }
 
 type Client struct {
-	apiRoot       *url.URL
-	token         string
-	userAgent     string
-	http          *http.Client
-	logger        *slog.Logger
-	cacheDir      string
-	cacheTTL      time.Duration
-	cacheMaxBytes int64
+	authenticationFailure func()
+	apiRoot               *url.URL
+	token                 string
+	userAgent             string
+	http                  *http.Client
+	logger                *slog.Logger
+	cacheDir              string
+	snapshots             *snapshot.Manager
+	cacheTTL              time.Duration
+	cacheMaxBytes         int64
+	caBundle              []byte
 
 	pullMu sync.Mutex
 	pull   *PullEngine
@@ -91,6 +98,7 @@ func NewClient(options Options) (*Client, error) {
 			tlsConfig.MinVersion = tls.VersionTLS12
 		}
 	}
+	var caBundle []byte
 	if options.CAFile != "" {
 		roots, err := x509.SystemCertPool()
 		if err != nil {
@@ -103,6 +111,7 @@ func NewClient(options Options) (*Client, error) {
 		if !roots.AppendCertsFromPEM(pem) {
 			return nil, errors.New("GOGS_CA_FILE contains no valid certificates")
 		}
+		caBundle = pem
 		tlsConfig.RootCAs = roots
 	}
 	transport.TLSClientConfig = tlsConfig
@@ -132,8 +141,10 @@ func NewClient(options Options) (*Client, error) {
 		http:          client,
 		logger:        logger,
 		cacheDir:      options.CacheDir,
+		snapshots:     options.Snapshots,
 		cacheTTL:      options.CacheTTL,
 		cacheMaxBytes: options.CacheMaxBytes,
+		caBundle:      caBundle,
 	}, nil
 }
 
@@ -303,6 +314,9 @@ func (c *Client) writeJSON(ctx context.Context, method string, destination any, 
 }
 
 func (c *Client) logRequest(ctx context.Context, status int, duration time.Duration, code ErrorCode) {
+	if code == CodeAuthenticationFailed && c.authenticationFailure != nil {
+		c.authenticationFailure()
+	}
 	metadata, _ := ctx.Value(requestMetadataKey{}).(requestMetadata)
 	c.logger.InfoContext(ctx, "Gogs request completed.",
 		"request_id", metadata.requestID,
@@ -367,4 +381,15 @@ func sameOrigin(left, right *url.URL) bool {
 func cloneURL(value *url.URL) *url.URL {
 	cloned := *value
 	return &cloned
+}
+
+// SetSnapshotManager connects shared cache accounting before the client serves requests.
+func (c *Client) SetSnapshotManager(manager *snapshot.Manager) { c.snapshots = manager }
+
+// SetAuthenticationFailureHandler installs token invalidation before serving requests.
+func (c *Client) SetAuthenticationFailureHandler(handler func()) { c.authenticationFailure = handler }
+func (c *Client) invalidateAuthentication(err error) {
+	if err != nil && AsError(err).Code == CodeAuthenticationFailed && c.authenticationFailure != nil {
+		c.authenticationFailure()
+	}
 }

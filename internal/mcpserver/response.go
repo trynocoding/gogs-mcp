@@ -7,12 +7,15 @@ type ToolResponse[T any] struct {
 }
 
 type ResponseMeta struct {
-	RequestID     string   `json:"request_id"`
-	Truncated     bool     `json:"truncated"`
-	NextPage      *int     `json:"next_page,omitempty"`
-	NextStartLine *int     `json:"next_start_line,omitempty"`
-	CacheHit      bool     `json:"cache_hit,omitempty"`
-	Warnings      []string `json:"warnings,omitempty"`
+	NextBefore     int64    `json:"next_before,omitempty"`
+	NextBodyOffset *int     `json:"next_body_offset,omitempty"`
+	NextAfterID    int64    `json:"next_after_id,omitempty"`
+	RequestID      string   `json:"request_id"`
+	Truncated      bool     `json:"truncated"`
+	NextPage       *int     `json:"next_page,omitempty"`
+	NextStartLine  *int     `json:"next_start_line,omitempty"`
+	CacheHit       bool     `json:"cache_hit,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
 type ToolError struct {
@@ -202,11 +205,12 @@ type Issue struct {
 }
 
 type IssueComment struct {
-	ID        int64     `json:"id"`
-	User      IssueUser `json:"user"`
-	Body      string    `json:"body"`
-	CreatedAt string    `json:"created_at"`
-	UpdatedAt string    `json:"updated_at"`
+	NextBodyOffset *int      `json:"next_body_offset,omitempty"`
+	ID             int64     `json:"id"`
+	User           IssueUser `json:"user"`
+	Body           string    `json:"body"`
+	CreatedAt      string    `json:"created_at"`
+	UpdatedAt      string    `json:"updated_at"`
 }
 
 type IssueCommentPage struct {
@@ -229,6 +233,7 @@ type PullRequestSummary struct {
 }
 
 type PullRequestPage struct {
+	TotalScope   string               `json:"total_scope"`
 	PullRequests []PullRequestSummary `json:"pull_requests"`
 	State        string               `json:"state"`
 	Limit        int                  `json:"limit"`

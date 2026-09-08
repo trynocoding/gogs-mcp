@@ -316,7 +316,9 @@ func TestEnsureCleansUpAfterFailedExtraction(t *testing.T) {
 	})
 	require.Error(t, err)
 
-	entries, readErr := os.ReadDir(filepath.Join(manager.root, "tmp"))
+	userRoot, err := manager.userRoot(testKey().UserID)
+	require.NoError(t, err)
+	entries, readErr := os.ReadDir(filepath.Join(userRoot, ".tmp"))
 	require.NoError(t, readErr)
 	assert.Empty(t, entries)
 }
@@ -384,9 +386,11 @@ func TestCachePermissions(t *testing.T) {
 	))
 	require.NoError(t, err)
 
+	userRoot, err := manager.userRoot(testKey().UserID)
+	require.NoError(t, err)
 	paths := []string{
 		root,
-		filepath.Join(root, "tmp"),
+		filepath.Join(userRoot, ".tmp"),
 		filepath.Dir(result.Dir),
 		result.Dir,
 		filepath.Join(result.Dir, "sub"),

@@ -20,7 +20,7 @@ type Client interface {
 	GetAuthenticatedUser(context.Context) (gogs.User, error)
 	ListRepositories(context.Context) ([]gogs.Repository, error)
 	GetRepository(context.Context, string, string) (gogs.Repository, error)
-	ListDirectory(context.Context, string, string, string, string) ([]gogs.ContentEntry, string, error)
+	ListDirectoryPage(context.Context, string, string, string, string, int, int) ([]gogs.ContentEntry, string, int, error)
 	GetFile(context.Context, string, string, string, string) (gogs.FileContent, error)
 	ListBranches(context.Context, string, string) ([]gogs.Branch, error)
 	GetBranch(context.Context, string, string, string) (gogs.Branch, error)
@@ -31,7 +31,7 @@ type Client interface {
 	ListIssues(context.Context, string, string, string, int) ([]gogs.IssueSummary, int, error)
 	GetIssue(context.Context, string, string, int64) (gogs.Issue, error)
 	ListIssueComments(context.Context, string, string, int64, string) ([]gogs.IssueComment, error)
-	ListPullRequests(context.Context, string, string, string, int) ([]gogs.PullRequestSummary, int, error)
+	ListPullRequests(context.Context, string, string, string, int, int64) ([]gogs.PullRequestSummary, int, int64, error)
 	GetPullRequest(context.Context, string, string, int64) (gogs.PullRequest, error)
 	GetPullRequestDiff(context.Context, string, string, int64, string, []string, int) (gogs.PullRequestDiff, error)
 	ListRepositoryLabels(context.Context, string, string) ([]gogs.RepositoryLabel, error)
@@ -87,6 +87,7 @@ func New(client Client, snapshots *snapshot.Manager, logger *slog.Logger, search
 		},
 	)
 
+	server.AddReceivingMiddleware(toolBudget)
 	destructive := false
 	openWorld := true
 	mcp.AddTool(server, &mcp.Tool{

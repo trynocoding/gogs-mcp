@@ -185,9 +185,7 @@ func registerSearchTools(server *mcp.Server, client Client, snapshots *snapshot.
 
 		// The timeout scopes only the search itself; the download and
 		// extraction keep their own HTTP and size bounds.
-		searchContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), request.timeout)
-		defer cancel()
-		found, stats, err := snapshot.Search(searchContext, result.Dir, request.options)
+		found, stats, err := searchSnapshot(ctx, result.Dir, request.options, request.timeout)
 		if err != nil {
 			result, response := searchCodeError(requestID, mapSnapshotError(err))
 			return result, response, nil
@@ -373,4 +371,10 @@ func searchCodeInputSchema() *jsonschema.Schema {
 
 func floatPointer(value float64) *float64 {
 	return &value
+}
+
+func searchSnapshot(ctx context.Context, dir string, options snapshot.Options, timeout time.Duration) ([]snapshot.Match, snapshot.Stats, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return snapshot.Search(ctx, dir, options)
 }

@@ -84,13 +84,13 @@ Gogs checkout 不在默认位置时，用 `GOGS_E2E_SOURCE_DIR` 指定路径。�
 
 所有结果边界都可观察：默认最多返回 50 个匹配（`max_results` 可以调到 500），每个匹配带文件路径、从 1 起算的行号和字节列号、匹配行，以及前后各两行上下文（`context_lines`，0 到 10）。命中 `max_results`、64 KiB 输出上限或搜索时限（`timeout_seconds`，1 到 300）任何一个，`meta.truncated` 都会置位并附警告。超时但已有部分结果时照常返回；一无所获的超时返回 `SEARCH_TIMEOUT`。`include` 和 `exclude` 的 glob 过滤路径，`.git` 始终排除。二进制文件（含 NUL 字节或无效 UTF-8）和超过 1 MiB 的文件（上限 `GOGS_MCP_MAX_FILE_BYTES`）会跳过，并在警告里说明。重复搜索同一个 commit 时，结果带 `meta.cache_hit`，不会再请求 Gogs。
 
-快照缓存有上限：24 小时（`GOGS_MCP_CACHE_TTL`）没被用到的快照过期；每个用户的缓存超过 2 GiB（`GOGS_MCP_CACHE_MAX_BYTES`）时，先淘汰最近最少使用的快照，再开始新下载。正在被搜索使用的快照不会被淘汰；实在腾不出空间，这次搜索就以 `CACHE_CAPACITY_EXCEEDED` 失败，而不是继续下载。`gogs-mcp cache clean` 清掉当前用户的快照缓存和 pull request diff 缓存，`gogs-mcp cache clean --user <数字ID>` 不用凭据清掉指定用户的缓存，`gogs-mcp cache clean --all` 清掉所有缓存根；配置、令牌和缓存根之外的任何东西都不会动。
+快照和 PR Git 仓库共用按 Gogs 实例、用户划分的容量预算（`GOGS_MCP_CACHE_MAX_BYTES`，默认 2 GiB），临时解包和 Git 写入也计入预算，在文件增长前预留空间。按 TTL（默认 24 小时）和最近使用时间淘汰；跨客户端、跨进程保护正在读取的缓存，空间不足返回 `CACHE_CAPACITY_EXCEEDED`。数据目录为 `<cache>/<实例哈希>/<userID>/`，Git 仓库放在 `.pull/`，锁放在 `.locks/`。`cache clean`、`cache clean --user <数字ID>` 和 `cache clean --all` 清理对应范围的数据，发现正在使用的条目会拒绝清理。空锁文件及其父目录保留，保证等待中的请求仍使用同一个锁。
 
-Gogs 的 issue 只用于仓库内部讨论；需求仍以 Jira 为准，本服务器不与 Jira 同步。`list_issues` 只接受 `open` 和 `closed` 两个状态值——Gogs v0.14.2 会把其他值一律当成 open；page size 也不让传，服务端写死了。有没有下一页看 Gogs 的 `Link` 响应头，有的话通过 `meta.next_page` 告诉你。`list_issues` 返回紧凑摘要，不带正文；`get_issue` 返回完整记录，含正文、创建者、指派人、标签、里程碑、评论数和时间戳。找不到时统一返回同一个 not-found 错误码，不区分是仓库不存在还是 issue 不存在。`list_issue_comments` 先验证 `since` 是不是合法的 RFC3339 时间戳，再去请求 Gogs；结果受 `max_comments`（默认 100，最多 500）和 64 KiB 输出上限约束，碰到任一上限就置位 `meta.truncated` 并附警告。
+Gogs 的 issue 只用于仓库内部讨论；需求仍以 Jira 为准，本服务器不与 Jira 同步。`list_issues` 只接受 `open` 和 `closed` 两个状态值——Gogs v0.14.2 会把其他值一律当成 open；page size 也不让传，服务端写死了。有没有下一页看 Gogs 的 `Link` 响应头，有的话通过 `meta.next_page` 告诉你。`list_issues` 返回紧凑摘要，不带正文；`get_issue` 返回记录，含分块正文、创建者、指派人、标签、里程碑、评论数和时间戳。找不到时统一返回同一个 not-found 错误码，不区分是仓库不存在还是 issue 不存在。`list_issue_comments` 先验证 `since` 是不是合法的 RFC3339 时间戳，再去请求 Gogs；结果受 `max_comments`（默认 100，最多 500）和 64 KiB 输出上限约束，碰到任一上限就置位 `meta.truncated` 并附警告。
 
 Gogs v0.14.2 没有 pull request API。`list_pull_requests`、`get_pull_request` 和 `get_pull_request_diff` 用 Gogs 实际提供的东西拼出 pull request 数据：base 仓库上的 `refs/pull/{number}/head` 引用、底层的 issue，以及 git 协议。三个工具都是只读的，始终注册。
 
-`list_pull_requests` 用 `ls-remote` 列出仓库的全部 pull 引用，新的在前，逐条拼上 issue 元数据。`state` 接受 `open`（默认）、`closed` 和 `all`；`limit` 默认 30，最多 100。每条结果都要查一次 issue，所以结果按 `limit` 截断，没有分页。
+`list_pull_requests` 用 `ls-remote` 列出仓库的全部 pull 引用，新的在前，逐条拼上 issue 元数据。`state` 接受 `open`（默认）、`closed` 和 `all`；`limit` 默认 30，最多 100。每次最多检查 100 个引用，包括被状态过滤掉的条目。用 `before: meta.next_before` 继续读取；过滤后为空也可能仍有下一页，`meta.truncated` 表示还有引用。`total` 是全部已公布引用的数量，`total_scope` 为 `all_advertised_refs`，不是按状态过滤后的数量。
 
 `get_pull_request` 补上正文、标签和 web URL，外加头提交 SHA。目标分支在 API 里拿不到，`base_ref` 填的是仓库默认分支，`base_ref_assumed` 为 `true`；pull request 实际指向别的分支时，给 diff 工具显式传 base。
 
@@ -210,3 +210,11 @@ gogs-mcp version [--json]
 ```
 
 退出码约定：配置错误为 2；`verify` 遇到连接、认证、TLS、超时错误为 3；其他内部错误为 1。
+
+### 资源边界与续读
+
+`get_issue` 和 `get_pull_request` 接受 `body_offset`、`body_max_bytes`（4–8192 个 UTF-8 字节，默认 8192），用 `meta.next_body_offset` 继续读取。偏移针对当前正文；两次请求之间发生编辑时，内容可能变化。Issue 写入结果保留成功创建或更新的资源标识，正文返回有界预览。`list_issue_comments` 每条预览 256 字节，用 `after_id: meta.next_after_id` 翻页；单条长评论用 `comment_id`、`body_offset` 和评论中的 `next_body_offset` 分块读完。
+
+普通结构化输出最多 64 KiB，PR diff 响应最多 4 MiB，均包括 JSON 转义和元数据。描述与 diff 文本过长时裁剪并附警告，路径和资源标识保持完整。元数据本身仍超限时返回 `RESPONSE_TOO_LARGE`，可缩小页大小重试。目录浏览通过 Git tree 获取条目，只为当前页读取有界的 Contents 元数据前缀，避免传输文件的 base64 正文。
+
+PR Git 请求使用配置的 CA 和 HTTP 超时。生成 patch 前限制输入：选中变更及重命名候选合计最多 2000 个、单个 blob 1 MiB、选中输入合计 8 MiB；提交图每次遍历最多 100000 个提交，单个提交对象 1 MiB、累计 64 MiB。超限明确报错，大 diff 可缩小 `paths` 范围。提交列表包含合并进来的旁支，并排除 merge base 的全部祖先。一个进程内所有工具服务共用 8 个执行槽，每次请求最多 5 分钟；搜索保留调用方取消信号。

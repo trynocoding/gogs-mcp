@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -15,17 +14,21 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"gogs-mcp/internal/diskcache"
+
 	"github.com/cockroachdb/errors"
+	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/cache"
 	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
 
@@ -87,6 +90,7 @@ type PullEngineOptions struct {
 	CacheDir string
 	Username string
 	Token    string
+	CABundle []byte
 	Timeout  time.Duration
 	// CacheTTL expires diff cache repositories untouched for this long;
 	// non-positive values fall back to defaultPullCacheTTL.
@@ -107,12 +111,11 @@ type PullEngine struct {
 	cacheDir      string
 	username      string
 	token         string
+	caBundle      []byte
 	timeout       time.Duration
 	cacheTTL      time.Duration
 	cacheMaxBytes int64
 	logger        *slog.Logger
-
-	mu sync.Mutex
 }
 
 // Defaults for the diff cache bounds; they mirror the snapshot cache limits.
@@ -147,6 +150,7 @@ func NewPullEngine(options PullEngineOptions) (*PullEngine, error) {
 		username:      options.Username,
 		token:         options.Token,
 		timeout:       timeout,
+		caBundle:      append([]byte(nil), options.CABundle...),
 		cacheTTL:      cacheTTL,
 		cacheMaxBytes: cacheMaxBytes,
 		logger:        logger,
@@ -156,9 +160,9 @@ func NewPullEngine(options PullEngineOptions) (*PullEngine, error) {
 // CleanCache removes every cached repository. It is the git counterpart of
 // the snapshot cache cleanup behind "gogs-mcp cache clean".
 func (e *PullEngine) CleanCache() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return os.RemoveAll(e.pullCacheRoot())
+	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
+	defer cancel()
+	return diskcache.RemoveTree(ctx, e.pullCacheRoot(), e.cacheDir)
 }
 
 // ListPullRefs returns every pull request head that the repository currently
@@ -172,7 +176,8 @@ func (e *PullEngine) ListPullRefs(ctx context.Context, cloneURL *url.URL) ([]Pul
 		URLs: []string{cloneURL.String()},
 	})
 	refs, err := remote.ListContext(ctx, &git.ListOptions{
-		Auth: e.authFor(cloneURL),
+		Auth:     e.authFor(cloneURL),
+		CABundle: e.caBundle,
 	})
 	if errors.Is(err, transport.ErrEmptyRemoteRepository) {
 		// An empty repository advertises no refs, which go-git surfaces as an
@@ -218,37 +223,38 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	repoPath := e.repoPathFor(cloneURL)
-	e.sweepPullCache(time.Now(), repoPath)
-
-	repo, err := e.cachedRepo(cloneURL)
+	writer, err := diskcache.Acquire(ctx, e.cacheDir, e.cacheDir+".writer", false)
 	if err != nil {
+		return nil, classifyTransportError(err)
+	}
+	defer writer.Close()
+	repoPath := e.repoPathFor(cloneURL)
+	entry, err := diskcache.Acquire(ctx, e.cacheDir, repoPath, false)
+	if err != nil {
+		return nil, classifyTransportError(err)
+	}
+	defer entry.Close()
+	budget := &diskcache.Budget{Root: e.cacheDir, Keep: repoPath, MaxBytes: e.cacheMaxBytes, TTL: e.cacheTTL}
+	if err := budget.MakeRoom(0); err != nil {
+		return nil, classifyGitError(err)
+	}
+	repo, err := e.cachedRepo(cloneURL, budget)
+	if err != nil {
+		if errors.Is(err, diskcache.ErrCapacity) {
+			_ = os.RemoveAll(repoPath)
+		}
 		return nil, err
 	}
 	if err := e.fetchRefs(ctx, repo, cloneURL, number, baseRef); err != nil {
-		return nil, err
-	}
-	// The fetch is a fresh use of the repository; refresh the TTL timestamp
-	// before any sweep can run, so a fetch that crosses the expiry boundary
-	// is never swept away mid-call.
-	touchCache(repoPath)
-	if err := e.enforceCacheCapacity(repoPath); err != nil {
-		return nil, err
-	}
-	// The single-repository check above guarantees the bound is reachable by
-	// evicting the older repositories. Eviction can fail on a hostile
-	// filesystem, and the sweep then drops the just-fetched repository to
-	// keep the bound honest; report that as a capacity error instead of
-	// reading a repository whose directory has just been removed.
-	if e.sweepPullCache(time.Now(), repoPath) {
-		return nil, &Error{
-			Code:      CodeCacheCapacityExceeded,
-			Message:   "The pull cache could not be kept within its size limit; raise GOGS_MCP_CACHE_MAX_BYTES to serve this repository.",
-			Retryable: true,
+		if errors.Is(err, diskcache.ErrCapacity) {
+			_ = os.RemoveAll(repoPath)
 		}
+		return nil, err
+	}
+	touchCache(repoPath)
+	if err := budget.MakeRoom(0); err != nil {
+		_ = os.RemoveAll(repoPath)
+		return nil, classifyGitError(err)
 	}
 
 	headHash, err := resolveCachedRef(repo, fmt.Sprintf("refs/gogs-mcp/pull/%d/head", number))
@@ -260,6 +266,10 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 		return nil, err
 	}
 
+	mergeBases, err := boundedMergeBases(ctx, repo, headHash, baseHash)
+	if err != nil {
+		return nil, err
+	}
 	headCommit, err := repo.CommitObject(headHash)
 	if err != nil {
 		return nil, &Error{Code: CodeGogsError, Message: "Could not read the pull request head commit.", cause: err}
@@ -269,10 +279,6 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 		return nil, &Error{Code: CodeGogsError, Message: "Could not read the base ref commit.", cause: err}
 	}
 
-	mergeBases, err := headCommit.MergeBase(baseCommit)
-	if err != nil {
-		return nil, &Error{Code: CodeGogsError, Message: "Could not compute the merge base.", cause: err}
-	}
 	if len(mergeBases) == 0 {
 		return nil, &Error{
 			Code:    CodeInvalidArgument,
@@ -281,7 +287,7 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	}
 	mergeBase := mergeBases[0]
 
-	commits, err := commitsSince(repo, mergeBase.Hash, headHash)
+	commits, err := commitsSince(ctx, repo, mergeBase.Hash, headHash)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +306,7 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	}
 
 	headChanges, err := object.DiffTreeWithOptions(ctx, mergeBaseTree, headTree, &object.DiffTreeOptions{
-		DetectRenames: true,
+		DetectRenames: false,
 		RenameScore:   50,
 	})
 	if err != nil {
@@ -313,18 +319,24 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 	}
 
 	if len(filters) > 0 {
+		headChanges = renameCandidates(headChanges, filters)
+	}
+	if err := validatePatchWork(ctx, headChanges); err != nil {
+		return nil, err
+	}
+	headChanges, err = object.DetectRenames(headChanges, &object.DiffTreeOptions{DetectRenames: true, RenameScore: 50})
+	if err != nil {
+		return nil, classifyGitError(err)
+	}
+	if len(filters) > 0 {
 		headChanges = filterChanges(headChanges, filters)
 	}
-	patch, err := headChanges.Patch()
-	if err != nil {
-		return nil, &Error{Code: CodeGogsError, Message: "Could not build the pull request patch.", cause: err}
-	}
-
 	touchCache(repoPath)
-	diff, err := buildPullDiff(headChanges, patch, commits, mergeBase.Hash.String(), maxBytes)
+	diff, err := buildBoundedPullDiff(ctx, headChanges, commits, mergeBase.Hash.String(), maxBytes)
 	if err != nil {
 		return nil, err
 	}
+
 	diff.MergeState = mergeState
 	diff.MergeConflictPaths = conflictPaths
 	diff.BaseCommits = baseCommits
@@ -333,7 +345,7 @@ func (e *PullEngine) DiffPull(ctx context.Context, cloneURL *url.URL, number int
 
 // pullCacheRoot is the directory holding the bare cache repositories.
 func (e *PullEngine) pullCacheRoot() string {
-	return filepath.Join(e.cacheDir, "pull")
+	return filepath.Join(e.cacheDir, ".pull")
 }
 
 // CleanPullCacheDir removes the pull request git cache below a cache
@@ -343,111 +355,18 @@ func CleanPullCacheDir(dir string) error {
 	if dir == "" {
 		return nil
 	}
-	return os.RemoveAll(filepath.Join(dir, "pull"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := diskcache.RemoveTree(ctx, filepath.Join(dir, ".pull"), dir); err != nil {
+		return err
+	}
+	return diskcache.RemoveTree(ctx, filepath.Join(dir, "pull"), dir)
 }
 
-// repoPathFor derives the stable cache path of a clone URL. The caller must
-// hold e.mu.
+// repoPathFor derives the stable cache path of a clone URL. The caller holds the shared user writer lock.
 func (e *PullEngine) repoPathFor(cloneURL *url.URL) string {
 	sum := sha256.Sum256([]byte(cloneURL.String()))
 	return filepath.Join(e.pullCacheRoot(), hex.EncodeToString(sum[:8])+".git")
-}
-
-// sweepPullCache enforces the TTL and the size bound of the diff cache
-// before and after a fetch. The repository about to be used, or just
-// fetched, is evicted last, and only if the cache remains oversized;
-// cachedRepo rebuilds whatever the sweep removes before a fetch, while the
-// caller of a fetch reports the cache capacity error itself. Failures are
-// logged and otherwise ignored, because the sweep is an optimization rather
-// than a correctness step. The return value reports whether the keep
-// repository was dropped to restore the bound, which the caller turns into
-// a capacity error. The caller must hold e.mu.
-func (e *PullEngine) sweepPullCache(now time.Time, keep string) bool {
-	entries, err := os.ReadDir(e.pullCacheRoot())
-	if err != nil {
-		return false
-	}
-	type cached struct {
-		path     string
-		size     int64
-		modified time.Time
-	}
-	alive := make([]cached, 0, len(entries))
-	var total int64
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		path := filepath.Join(e.pullCacheRoot(), entry.Name())
-		if now.Sub(info.ModTime()) > e.cacheTTL {
-			if err := os.RemoveAll(path); err != nil {
-				e.logger.Warn("Could not remove the expired pull cache repository.", "path", path, "error", err)
-				continue
-			}
-			e.logger.Info("Removed the expired pull cache repository.", "path", path)
-			continue
-		}
-		size := dirSize(path)
-		total += size
-		alive = append(alive, cached{path: path, size: size, modified: info.ModTime()})
-	}
-	if total <= e.cacheMaxBytes {
-		return false
-	}
-	sort.SliceStable(alive, func(i, j int) bool {
-		return alive[i].modified.Before(alive[j].modified)
-	})
-	for _, item := range alive {
-		if total <= e.cacheMaxBytes {
-			return false
-		}
-		if item.path == keep {
-			continue
-		}
-		if err := os.RemoveAll(item.path); err != nil {
-			e.logger.Warn("Could not remove the evicted pull cache repository.", "path", item.path, "error", err)
-			continue
-		}
-		total -= item.size
-		e.logger.Info("Evicted the pull cache repository.", "path", item.path)
-	}
-	if total > e.cacheMaxBytes {
-		// The cache is still oversized with only the in-use repository
-		// left; dropping it is cheaper than exceeding the bound, and the
-		// caller rebuilds it on the next fetch.
-		if err := os.RemoveAll(keep); err != nil {
-			e.logger.Warn("Could not remove the oversized pull cache repository.", "path", keep, "error", err)
-		}
-		return true
-	}
-	return false
-}
-
-// enforceCacheCapacity keeps the size bound honest after a fetch: the sweep
-// runs beforehand and cannot know how large the incoming objects are. A
-// repository that arrives above the limit is dropped immediately and
-// reported, because no amount of eviction could keep it. The sweep then
-// evicts the older repositories until the total is within the bound again,
-// which also covers a cache that breaches the limit through the
-// accumulation of individually fitting repositories. The caller must hold
-// e.mu.
-func (e *PullEngine) enforceCacheCapacity(repoPath string) error {
-	size := dirSize(repoPath)
-	if size <= e.cacheMaxBytes {
-		return nil
-	}
-	if err := os.RemoveAll(repoPath); err != nil {
-		e.logger.Warn("Could not remove the oversized pull cache repository.", "path", repoPath, "error", err)
-	}
-	return &Error{
-		Code:      CodeCacheCapacityExceeded,
-		Message:   fmt.Sprintf("The fetched repository is %d bytes and exceeds the pull cache limit of %d bytes; raise GOGS_MCP_CACHE_MAX_BYTES to serve this repository.", size, e.cacheMaxBytes),
-		Retryable: true,
-	}
 }
 
 // touchCache marks a cache repository as freshly used, which drives the TTL
@@ -495,6 +414,25 @@ func normalizePathFilters(paths []string) []string {
 
 // filterChanges keeps the changes whose source or destination path matches
 // one of the filters.
+// renameCandidates keeps the opposite side of a possible rename even when
+// only the old or new path was requested. These candidates share the same
+// input budget as the selected files; unrelated modifications are excluded.
+func renameCandidates(changes object.Changes, filters []string) object.Changes {
+	selected := filterChanges(changes, filters)
+	var needAdded, needDeleted bool
+	for _, change := range selected {
+		needDeleted = needDeleted || change.From.Name == ""
+		needAdded = needAdded || change.To.Name == ""
+	}
+	result := make(object.Changes, 0, len(selected))
+	for _, change := range changes {
+		if matchAnyPath(change.From.Name, filters) || matchAnyPath(change.To.Name, filters) || (needAdded && change.From.Name == "") || (needDeleted && change.To.Name == "") {
+			result = append(result, change)
+		}
+	}
+	return result
+}
+
 func filterChanges(changes object.Changes, filters []string) object.Changes {
 	kept := make(object.Changes, 0, len(changes))
 	for _, change := range changes {
@@ -524,7 +462,7 @@ func matchAnyPath(path string, filters []string) bool {
 // Only a real merge can decide the outcome, so the conflicting state reports
 // the files that both sides touched.
 func (e *PullEngine) mergeStateFor(ctx context.Context, repo *git.Repository, mergeBase, base plumbing.Hash, mergeBaseTree, baseTree *object.Tree, headChanges object.Changes) (string, []string, int, error) {
-	baseCommits, err := commitsSince(repo, mergeBase, base)
+	baseCommits, err := commitsSince(ctx, repo, mergeBase, base)
 	if err != nil {
 		return "", nil, 0, err
 	}
@@ -594,13 +532,13 @@ func buildPullDiff(changes object.Changes, patch *object.Patch, commits []PullCo
 		})
 	}
 
-	var buffer bytes.Buffer
-	if err := patch.Encode(&buffer); err != nil {
+	buffer := limitedDiffWriter{maximum: maxBytes}
+	if err := patch.Encode(&buffer); err != nil && !errors.Is(err, errDiffLimit) {
 		return nil, &Error{Code: CodeGogsError, Message: "Could not render the pull request diff.", cause: err}
 	}
 	truncated := false
-	if maxBytes > 0 && buffer.Len() > maxBytes {
-		truncateToLastLine(&buffer, maxBytes)
+	if buffer.truncated {
+		truncateToLastLine(&buffer.Buffer, maxBytes)
 		truncated = true
 	}
 
@@ -618,11 +556,13 @@ func buildPullDiff(changes object.Changes, patch *object.Patch, commits []PullCo
 // repository is private to the process (0700): the fetched objects carry
 // repository data that only the authenticated token was meant to see, and
 // the 0700 mode gates access even to the world-readable pack files git
-// writes. The caller must hold e.mu.
-func (e *PullEngine) cachedRepo(cloneURL *url.URL) (*git.Repository, error) {
+// writes. The caller holds the shared user writer lock.
+func (e *PullEngine) cachedRepo(cloneURL *url.URL, budget *diskcache.Budget) (*git.Repository, error) {
 	repoPath := e.repoPathFor(cloneURL)
 
-	repo, openErr := git.PlainOpen(repoPath)
+	fs := &diskcache.Filesystem{Filesystem: osfs.New(repoPath), Budget: budget}
+	store := filesystem.NewStorageWithOptions(fs, cache.NewObjectLRUDefault(), filesystem.Options{LargeObjectThreshold: 1 << 20})
+	repo, openErr := git.Open(store, nil)
 	if openErr == nil {
 		// Repositories created by earlier versions may still be group or
 		// world readable; tighten them, because an actively used repository
@@ -645,9 +585,9 @@ func (e *PullEngine) cachedRepo(cloneURL *url.URL) (*git.Repository, error) {
 	if err := os.MkdirAll(repoPath, 0o700); err != nil {
 		return nil, &Error{Code: CodeInternal, Message: "Could not create the pull cache directory.", cause: err}
 	}
-	repo, err := git.PlainInit(repoPath, true)
+	repo, err := git.Init(store, nil)
 	if err != nil {
-		return nil, &Error{Code: CodeInternal, Message: "Could not initialize the pull cache repository.", cause: err}
+		return nil, classifyGitError(err)
 	}
 	return repo, nil
 }
@@ -672,9 +612,10 @@ func (e *PullEngine) fetchRefs(ctx context.Context, repo *git.Repository, cloneU
 			config.RefSpec(fmt.Sprintf("+refs/pull/%d/head:refs/gogs-mcp/pull/%d/head", number, number)),
 			config.RefSpec(fmt.Sprintf("+refs/heads/%s:refs/gogs-mcp/base", baseRef)),
 		},
-		Auth:  e.authFor(cloneURL),
-		Force: true,
-		Tags:  git.NoTags,
+		Auth:     e.authFor(cloneURL),
+		CABundle: e.caBundle,
+		Force:    true,
+		Tags:     git.NoTags,
 	})
 	if errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return nil
@@ -708,6 +649,12 @@ func (e *PullEngine) authFor(cloneURL *url.URL) transport.AuthMethod {
 
 // classifyGitError maps a go-git failure onto the shared error taxonomy.
 func classifyGitError(err error) *Error {
+	if errors.Is(err, diskcache.ErrCapacity) {
+		return &Error{Code: CodeCacheCapacityExceeded, Message: "The shared user cache is full.", Retryable: true, cause: err}
+	}
+	if classified := classifyTransportError(err); classified.Code == CodeTLSError || classified.Code == CodeCanceled {
+		return classified
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &Error{Code: CodeTimeout, Message: "The Gogs git request timed out.", Retryable: true, cause: err}
 	}
@@ -765,37 +712,66 @@ func resolveCachedRef(repo *git.Repository, ref string) (plumbing.Hash, error) {
 
 // commitsSince walks the history from head back to, but not including, the
 // merge base.
-func commitsSince(repo *git.Repository, mergeBase, head plumbing.Hash) ([]PullCommit, error) {
+func commitsSince(ctx context.Context, repo *git.Repository, mergeBase, head plumbing.Hash) ([]PullCommit, error) {
 	if mergeBase == head {
 		return nil, nil
 	}
-	iterator, err := repo.Log(&git.LogOptions{From: head})
+	excluded, err := reachableCommits(ctx, repo, mergeBase, nil)
 	if err != nil {
-		return nil, &Error{Code: CodeGogsError, Message: "Could not walk the pull request history.", cause: err}
+		return nil, err
 	}
-	defer iterator.Close()
-
-	commits := make([]PullCommit, 0)
-	for {
-		commit, err := iterator.Next()
-		if errors.Is(err, io.EOF) {
-			break
+	included, err := reachableCommits(ctx, repo, head, excluded)
+	if err != nil {
+		return nil, err
+	}
+	commits := make([]PullCommit, 0, len(included))
+	for _, commit := range included {
+		message, _, _ := strings.Cut(commit.Message, "\n")
+		commits = append(commits, PullCommit{SHA: commit.Hash.String(), Message: message, Author: commit.Author.Name, Date: commit.Author.When.UTC().Format(time.RFC3339)})
+	}
+	sort.Slice(commits, func(i, j int) bool {
+		if commits[i].Date != commits[j].Date {
+			return commits[i].Date > commits[j].Date
 		}
+		return commits[i].SHA < commits[j].SHA
+	})
+	return commits, nil
+}
+
+// reachableCommits bounds graph traversal and excludes the complete base history.
+func reachableCommits(ctx context.Context, repo *git.Repository, head plumbing.Hash, excluded map[plumbing.Hash]*object.Commit) (map[plumbing.Hash]*object.Commit, error) {
+	const maximumHistoryCommits = 100000
+	seen := make(map[plumbing.Hash]*object.Commit)
+	var bytesRead int64
+	pending := []plumbing.Hash{head}
+	for len(pending) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, classifyTransportError(err)
+		}
+		hash := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if seen[hash] != nil || excluded[hash] != nil {
+			continue
+		}
+		if len(seen) >= maximumHistoryCommits {
+			return nil, &Error{Code: CodeResponseTooLarge, Message: "The Git history exceeds the 100000-commit traversal limit."}
+		}
+		encoded, err := repo.Storer.EncodedObject(plumbing.CommitObject, hash)
+		if err != nil {
+			return nil, &Error{Code: CodeGogsError, Message: "Could not read a history commit.", cause: err}
+		}
+		bytesRead += encoded.Size()
+		if encoded.Size() > 1<<20 || bytesRead > 64<<20 {
+			return nil, &Error{Code: CodeResponseTooLarge, Message: "Git history exceeds 1 MiB per commit or 64 MiB of commit data."}
+		}
+		commit, err := object.DecodeCommit(repo.Storer, encoded)
 		if err != nil {
 			return nil, &Error{Code: CodeGogsError, Message: "Could not walk the pull request history.", cause: err}
 		}
-		if commit.Hash == mergeBase {
-			break
-		}
-		message, _, _ := strings.Cut(commit.Message, "\n")
-		commits = append(commits, PullCommit{
-			SHA:     commit.Hash.String(),
-			Message: message,
-			Author:  commit.Author.Name,
-			Date:    commit.Author.When.UTC().Format(time.RFC3339),
-		})
+		seen[hash] = commit
+		pending = append(pending, commit.ParentHashes...)
 	}
-	return commits, nil
+	return seen, nil
 }
 
 // diffEntryPath derives the reported path from the tree change alone. A
@@ -850,4 +826,116 @@ func truncateToLastLine(buffer *bytes.Buffer, maxBytes int) {
 		cut--
 	}
 	buffer.Truncate(cut)
+}
+
+var errDiffLimit = errors.New("diff output limit reached")
+
+type limitedDiffWriter struct {
+	bytes.Buffer
+	maximum   int
+	truncated bool
+}
+
+func (w *limitedDiffWriter) Write(p []byte) (int, error) {
+	if w.maximum <= 0 {
+		return w.Buffer.Write(p)
+	}
+	remaining := w.maximum - w.Len()
+	if len(p) <= remaining {
+		return w.Buffer.Write(p)
+	}
+	n, _ := w.Buffer.Write(p[:remaining])
+	w.truncated = true
+	return n, errDiffLimit
+}
+
+func validatePatchWork(ctx context.Context, changes object.Changes) error {
+	const maxChangedFiles = 2000
+	const maxBlobBytes = 1 << 20
+	const maxInputBytes = 8 << 20
+	if len(changes) > maxChangedFiles {
+		return &Error{Code: CodeResponseTooLarge, Message: "The diff exceeds 2000 changed files; narrow paths."}
+	}
+	var total int64
+	for _, change := range changes {
+		if err := ctx.Err(); err != nil {
+			return classifyTransportError(err)
+		}
+		from, to, err := change.Files()
+		if err != nil {
+			return classifyGitError(err)
+		}
+		for _, file := range []*object.File{from, to} {
+			if file == nil {
+				continue
+			}
+			total += file.Size
+			if file.Size > maxBlobBytes || total > maxInputBytes {
+				return &Error{Code: CodeResponseTooLarge, Message: "Diff inputs exceed 1 MiB per blob or 8 MiB total; narrow paths or inspect file metadata."}
+			}
+		}
+	}
+	return nil
+}
+
+func buildBoundedPullDiff(ctx context.Context, changes object.Changes, commits []PullCommit, base string, maxBytes int) (*PullDiff, error) {
+	result := &PullDiff{MergeBase: base, Commits: commits, Files: []DiffFileStat{}}
+	output := limitedDiffWriter{maximum: maxBytes}
+	for _, change := range changes {
+		if err := ctx.Err(); err != nil {
+			return nil, classifyTransportError(err)
+		}
+		patch, err := change.PatchContext(ctx)
+		if err != nil {
+			return nil, classifyGitError(err)
+		}
+		for _, file := range patch.FilePatches() {
+			result.Files = append(result.Files, DiffFileStat{Path: diffEntryPath(change), Status: diffChangeStatus(change), Additions: countChunkLines(file, fdiff.Add), Deletions: countChunkLines(file, fdiff.Delete), IsBinary: file.IsBinary()})
+		}
+		if !output.truncated {
+			if err := patch.Encode(&output); err != nil && !errors.Is(err, errDiffLimit) {
+				return nil, classifyGitError(err)
+			}
+		}
+	}
+	if output.truncated {
+		truncateToLastLine(&output.Buffer, maxBytes)
+	}
+	result.Diff = output.String()
+	result.Truncated = output.truncated
+	return result, nil
+}
+
+func boundedMergeBases(ctx context.Context, repo *git.Repository, head, base plumbing.Hash) ([]*object.Commit, error) {
+	left, err := reachableCommits(ctx, repo, head, nil)
+	if err != nil {
+		return nil, err
+	}
+	right, err := reachableCommits(ctx, repo, base, nil)
+	if err != nil {
+		return nil, err
+	}
+	common := make(map[plumbing.Hash]*object.Commit)
+	for hash, commit := range left {
+		if right[hash] != nil {
+			common[hash] = commit
+		}
+	}
+	ancestors := make(map[plumbing.Hash]bool)
+	for _, commit := range common {
+		if err := ctx.Err(); err != nil {
+			return nil, classifyTransportError(err)
+		}
+		for _, parent := range commit.ParentHashes {
+			ancestors[parent] = true
+		}
+	}
+	var bases []*object.Commit
+	for hash, commit := range common {
+		if !ancestors[hash] {
+			bases = append(bases, commit)
+		}
+	}
+	sort.Slice(bases, func(i, j int) bool { return bases[i].Hash.String() < bases[j].Hash.String() })
+	return bases, nil
 }

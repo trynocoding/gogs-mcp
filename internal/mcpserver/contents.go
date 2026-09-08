@@ -53,12 +53,18 @@ func registerContentTools(server *mcp.Server, client Client) {
 			return result, response, nil
 		}
 		ctx = gogs.WithRequestMetadata(ctx, requestID, "list_directory")
-		entries, usedRef, err := client.ListDirectory(ctx, input.Owner, input.Repo, input.Path, input.Ref)
+		entries, usedRef, total, err := client.ListDirectoryPage(ctx, input.Owner, input.Repo, input.Path, input.Ref, input.Page, input.PerPage)
 		if err != nil {
 			result, response := contentError[DirectoryPage](requestID, err)
 			return result, response, nil
 		}
-		page, nextPage := paginateDirectory(entries, input.Path, usedRef, input.Page, input.PerPage)
+		page := paginateDirectory(entries, input.Path, usedRef, 1, input.PerPage)
+		page.Page, page.Total = input.Page, total
+		var nextPage *int
+		if input.Page <= (total-1)/input.PerPage && total > 0 {
+			next := input.Page + 1
+			nextPage = &next
+		}
 		return nil, ToolResponse[DirectoryPage]{
 			Data: &page,
 			Meta: ResponseMeta{RequestID: requestID, NextPage: nextPage},
@@ -88,7 +94,7 @@ func registerContentTools(server *mcp.Server, client Client) {
 	})
 }
 
-func paginateDirectory(entries []gogs.ContentEntry, repositoryPath, ref string, page, perPage int) (DirectoryPage, *int) {
+func paginateDirectory(entries []gogs.ContentEntry, repositoryPath, ref string, page, perPage int) DirectoryPage {
 	sorted := slices.Clone(entries)
 	slices.SortStableFunc(sorted, func(left, right gogs.ContentEntry) int {
 		if order := cmp.Compare(left.Path, right.Path); order != 0 {
@@ -115,11 +121,6 @@ func paginateDirectory(entries []gogs.ContentEntry, repositoryPath, ref string, 
 		}
 	}
 
-	var nextPage *int
-	if end < len(sorted) {
-		next := page + 1
-		nextPage = &next
-	}
 	return DirectoryPage{
 		Entries: items,
 		Path:    repositoryPath,
@@ -127,7 +128,7 @@ func paginateDirectory(entries []gogs.ContentEntry, repositoryPath, ref string, 
 		Page:    page,
 		PerPage: perPage,
 		Total:   len(sorted),
-	}, nextPage
+	}
 }
 
 func boundedFile(content gogs.FileContent, startLine, lineCount int) (File, ResponseMeta) {

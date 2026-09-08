@@ -285,7 +285,7 @@ func TestListIssueCommentsTruncatesAtMaxComments(t *testing.T) {
 	assert.Equal(t, int64(2), output.Data.Comments[1].ID)
 	assert.Equal(t, 2, output.Data.Max)
 	assert.True(t, output.Meta.Truncated)
-	require.Len(t, output.Meta.Warnings, 1)
+	require.NotEmpty(t, output.Meta.Warnings)
 	assert.Contains(t, output.Meta.Warnings[0], "max_comments limit of 2")
 }
 
@@ -305,11 +305,12 @@ func TestListIssueCommentsTruncatesAtByteBudget(t *testing.T) {
 	var output ToolResponse[IssueCommentPage]
 	decodeStructuredContent(t, result.StructuredContent, &output)
 	require.NotNil(t, output.Data)
-	require.Len(t, output.Data.Comments, 1)
+	require.Len(t, output.Data.Comments, 2)
+	require.NotNil(t, output.Data.Comments[0].NextBodyOffset)
 	assert.Equal(t, int64(1), output.Data.Comments[0].ID)
 	assert.True(t, output.Meta.Truncated)
 	require.NotEmpty(t, output.Meta.Warnings)
-	assert.Contains(t, output.Meta.Warnings[0], "64 KiB structured output limit")
+	assert.Contains(t, output.Meta.Warnings[0], "Comments are partial")
 }
 
 func TestCreateIssueIsAbsentWithoutWriteEnabled(t *testing.T) {

@@ -3,6 +3,7 @@ package gogs
 import (
 	"bytes"
 	"context"
+	"gogs-mcp/internal/diskcache"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -154,13 +155,25 @@ func TestDiffPullReportsRenameUnderNewPath(t *testing.T) {
 		plumbing.ReferenceName("refs/pull/1/head"), headHash)))
 	engine := newTestPullEngine(t)
 
-	diff, err := engine.DiffPull(context.Background(), &url.URL{Scheme: "file", Path: dir}, 1, "main", nil, 0)
+	for _, filters := range [][]string{nil, {"new.txt"}, {"old.txt"}} {
+		diff, err := engine.DiffPull(context.Background(), &url.URL{Scheme: "file", Path: dir}, 1, "main", filters, 0)
+		require.NoError(t, err)
+		require.Len(t, diff.Files, 1)
+		assert.Equal(t, "new.txt", diff.Files[0].Path)
+		assert.Equal(t, "renamed", diff.Files[0].Status)
+	}
+	// Similarity-based renames must also retain both sides of a path filter.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "new.txt"), []byte("rename me\nextra\n"), 0600))
+	_, err = worktree.Add("new.txt")
+	require.NoError(t, err)
+	edited, err := worktree.Commit("Edit renamed file", &git.CommitOptions{Author: signature})
+	require.NoError(t, err)
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference("refs/pull/1/head", edited)))
+	diff, err := engine.DiffPull(context.Background(), &url.URL{Scheme: "file", Path: dir}, 1, "main", []string{"new.txt"}, 0)
 	require.NoError(t, err)
 	require.Len(t, diff.Files, 1)
-	// The stat carries the new path, matching the filter matching and the
-	// b/ side of the diff header.
-	assert.Equal(t, "new.txt", diff.Files[0].Path)
 	assert.Equal(t, "renamed", diff.Files[0].Status)
+
 }
 
 func TestDiffPullProducesStandardUnifiedDiff(t *testing.T) {
@@ -238,7 +251,7 @@ func TestDiffPullRejectsRepositoryAboveCacheLimit(t *testing.T) {
 	assert.True(t, AsError(err).Retryable, "raising the limit must make the call retryable")
 
 	// The oversized repository must not linger until the next call.
-	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
+	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, ".pull"))
 	require.NoError(t, err)
 	assert.Empty(t, entries, "a repository above the limit must not be cached")
 }
@@ -267,11 +280,11 @@ func TestDiffPullKeepsAggregateWithinCacheLimit(t *testing.T) {
 	_, err = engine.DiffPull(ctx, urlB, 1, "main", nil, 0)
 	require.NoError(t, err)
 
-	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
+	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, ".pull"))
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "the cache must keep only the freshly fetched repository")
 	assert.Equal(t, filepath.Base(engine.repoPathFor(urlB)), entries[0].Name())
-	assert.LessOrEqual(t, dirSize(filepath.Join(engine.cacheDir, "pull")), limit)
+	assert.LessOrEqual(t, dirSize(filepath.Join(engine.cacheDir, ".pull")), limit)
 }
 
 func TestDiffPullReusesCacheRepository(t *testing.T) {
@@ -282,21 +295,22 @@ func TestDiffPullReusesCacheRepository(t *testing.T) {
 
 	_, err = engine.DiffPull(ctx, fixtureURL, 1, "main", nil, 0)
 	require.NoError(t, err)
-	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
+	entries, err := os.ReadDir(filepath.Join(engine.cacheDir, ".pull"))
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
 	// A second call must not create another cache repository.
 	_, err = engine.DiffPull(ctx, fixtureURL, 1, "main", nil, 0)
 	require.NoError(t, err)
-	entries, err = os.ReadDir(filepath.Join(engine.cacheDir, "pull"))
+	entries, err = os.ReadDir(filepath.Join(engine.cacheDir, ".pull"))
 	require.NoError(t, err)
 	assert.Len(t, entries, 1)
 
 	require.NoError(t, engine.CleanCache())
 	entries, err = os.ReadDir(engine.cacheDir)
 	require.NoError(t, err)
-	assert.Empty(t, entries)
+	require.Len(t, entries, 1)
+	assert.Equal(t, ".locks", entries[0].Name())
 }
 
 func TestDiffPullCreatesPrivateCacheRepository(t *testing.T) {
@@ -505,7 +519,7 @@ func TestDiffPullWarnsWhenFiltersMatchNothing(t *testing.T) {
 func TestSweepPullCacheEvictsExpiredAndOversizedRepositories(t *testing.T) {
 	newCache := func(t *testing.T, ttl time.Duration, maxBytes int64) (*PullEngine, string, string) {
 		t.Helper()
-		root := filepath.Join(t.TempDir(), "pull")
+		root := filepath.Join(t.TempDir(), ".pull")
 		stale := filepath.Join(root, "stale.git")
 		fresh := filepath.Join(root, "fresh.git")
 		for _, path := range []string{stale, fresh} {
@@ -525,7 +539,7 @@ func TestSweepPullCacheEvictsExpiredAndOversizedRepositories(t *testing.T) {
 		engine, stale, fresh := newCache(t, time.Hour, 0)
 		old := time.Now().Add(-2 * time.Hour)
 		require.NoError(t, os.Chtimes(stale, old, old))
-		engine.sweepPullCache(time.Now(), fresh)
+		require.NoError(t, (&diskcache.Budget{Root: engine.cacheDir, Keep: fresh, MaxBytes: engine.cacheMaxBytes, TTL: engine.cacheTTL}).MakeRoom(0))
 		assert.NoDirExists(t, stale)
 		assert.DirExists(t, fresh)
 	})
@@ -537,20 +551,20 @@ func TestSweepPullCacheEvictsExpiredAndOversizedRepositories(t *testing.T) {
 		// the kept repository.
 		now := time.Now()
 		require.NoError(t, os.Chtimes(stale, now.Add(-time.Minute), now.Add(-time.Minute)))
-		engine.sweepPullCache(now, fresh)
+		require.NoError(t, (&diskcache.Budget{Root: engine.cacheDir, Keep: fresh, MaxBytes: engine.cacheMaxBytes, TTL: engine.cacheTTL}).MakeRoom(0))
 		assert.NoDirExists(t, stale)
 		assert.DirExists(t, fresh)
 	})
 
-	t.Run("kept repository is dropped when nothing else fits", func(t *testing.T) {
+	t.Run("active repository prevents overcommit", func(t *testing.T) {
 		engine, _, fresh := newCache(t, time.Hour, 1)
-		engine.sweepPullCache(time.Now(), fresh)
-		assert.NoDirExists(t, fresh)
+		require.ErrorIs(t, (&diskcache.Budget{Root: engine.cacheDir, Keep: fresh, MaxBytes: engine.cacheMaxBytes}).MakeRoom(0), diskcache.ErrCapacity)
+		assert.DirExists(t, fresh)
 	})
 
 	t.Run("untouched within ttl", func(t *testing.T) {
 		engine, stale, fresh := newCache(t, time.Hour, 0)
-		engine.sweepPullCache(time.Now(), fresh)
+		require.NoError(t, (&diskcache.Budget{Root: engine.cacheDir, Keep: fresh, MaxBytes: engine.cacheMaxBytes, TTL: engine.cacheTTL}).MakeRoom(0))
 		assert.DirExists(t, stale)
 	})
 }

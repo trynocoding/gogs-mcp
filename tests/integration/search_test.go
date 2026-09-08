@@ -58,7 +58,7 @@ func TestSearchCodeUsesResolvedSHAAndImmutableArchive(t *testing.T) {
 			http.Error(writer, "not found", http.StatusNotFound)
 		case path == "/api/v1/repos/owner/private-shared/tags":
 			state.tagRequests++
-			writeJSON(t, writer, `[{"name":"v1.0.0","commit":{"sha":"`+integrationTagSHA+`"}}]`)
+			writeJSON(t, writer, `[{"name":"v1.0.0","commit":{"id":"`+integrationTagSHA+`"}}]`)
 		case strings.HasPrefix(path, "/api/v1/repos/owner/private-shared/commits/ccccccc"):
 			state.commitRequests++
 			writeJSON(t, writer, `{"sha":"`+integrationCommitSHA+`","commit":{"message":"Add fixtures"}}`)

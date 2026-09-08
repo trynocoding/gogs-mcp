@@ -136,6 +136,7 @@ func runServe(
 		return exitConfig
 	}
 
+	client.SetSnapshotManager(snapshots)
 	server := mcpserver.New(client, snapshots, logger, mcpserver.SearchDefaults{
 		Timeout:      cfg.SearchTimeout,
 		MaxFileBytes: cfg.MaxFileBytes,
