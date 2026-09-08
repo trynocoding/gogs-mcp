@@ -18,8 +18,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"gogs-mcp/internal/diskcache"
 
 	"github.com/cockroachdb/errors"
 )
@@ -73,7 +74,7 @@ var (
 	ErrUnsafeArchiveEntry = errors.New("the archive contains an unsafe entry path")
 	// ErrCacheCapacityExceeded reports that eviction could not make room for a
 	// new snapshot.
-	ErrCacheCapacityExceeded = errors.New("the snapshot cache cannot make room for a new snapshot")
+	ErrCacheCapacityExceeded = diskcache.ErrCapacity
 )
 
 // Key identifies one immutable snapshot. It is scoped to the normalized Gogs
@@ -89,12 +90,14 @@ type Key struct {
 // Metadata is the metadata.json document stored next to every published
 // snapshot. Credentials never appear in it.
 type Metadata struct {
-	SchemaVersion  int       `json:"schema_version"`
-	InstanceHash   string    `json:"instance_hash"`
-	UserID         int64     `json:"user_id"`
-	Repository     string    `json:"repository"`
-	CommitSHA      string    `json:"commit_sha"`
-	CreatedAt      time.Time `json:"created_at"`
+	SchemaVersion int       `json:"schema_version"`
+	InstanceHash  string    `json:"instance_hash"`
+	UserID        int64     `json:"user_id"`
+	Repository    string    `json:"repository"`
+	CommitSHA     string    `json:"commit_sha"`
+	CreatedAt     time.Time `json:"created_at"`
+	// LastAccessedAt records publication time for compatibility; directory mtime
+	// is the access clock, avoiding metadata rewrites while readers hold shared locks.
 	LastAccessedAt time.Time `json:"last_accessed_at"`
 	FileCount      int       `json:"file_count"`
 	TotalBytes     int64     `json:"total_bytes"`
@@ -107,11 +110,6 @@ type Manager struct {
 	instance string
 	limits   Limits
 	eviction Eviction
-
-	// inUse tracks how many active searches hold each commit directory so
-	// that eviction never deletes a snapshot mid-read.
-	useMu sync.Mutex
-	inUse map[string]int
 }
 
 // NewManager returns a manager that isolates snapshots per instance and user
@@ -126,7 +124,7 @@ func NewManager(root, instance string, limits Limits, eviction Eviction) (*Manag
 	if eviction.MaxBytes < 0 || eviction.TTL < 0 {
 		return nil, errors.New("eviction limits must not be negative")
 	}
-	return &Manager{root: root, instance: instance, limits: limits, eviction: eviction, inUse: make(map[string]int)}, nil
+	return &Manager{root: root, instance: instance, limits: limits, eviction: eviction}, nil
 }
 
 // Result describes a materialized snapshot.
@@ -154,65 +152,85 @@ func (m *Manager) Ensure(ctx context.Context, key Key, download func(context.Con
 	if err != nil {
 		return Result{}, err
 	}
+	userRoot, err := m.userRoot(key.UserID)
+	if err != nil {
+		return Result{}, err
+	}
 	final := filepath.Join(commitDir, "snapshot")
-	// Retain before the existence check so that a concurrent eviction in this
-	// process cannot remove the snapshot between the check and the first read.
-	release := m.retain(commitDir)
+	read, err := diskcache.Acquire(ctx, userRoot, commitDir, true)
+	if err != nil {
+		return Result{}, err
+	}
 	if info, err := os.Stat(final); err == nil && info.IsDir() {
-		m.touch(commitDir)
-		return Result{Dir: final, CacheHit: true, Release: release}, nil
+		now := time.Now()
+		_ = os.Chtimes(commitDir, now, now)
+		return Result{Dir: final, CacheHit: true, Release: func() { read.Close() }}, nil
 	}
-	release()
-
-	m.sweepStaleTemporaries()
-	if err := m.evictExpired(key.UserID); err != nil {
+	read.Close()
+	writer, err := diskcache.Acquire(ctx, userRoot, userRoot+".writer", false)
+	if err != nil {
 		return Result{}, err
 	}
-	if err := m.enforceCapacity(key.UserID); err != nil {
+	defer writer.Close()
+	entry, err := diskcache.Acquire(ctx, userRoot, commitDir, true)
+	if err == nil {
+		if info, statErr := os.Stat(final); statErr == nil && info.IsDir() {
+			return Result{Dir: final, CacheHit: true, Release: func() { entry.Close() }}, nil
+		}
+		entry.Close()
+		entry, err = diskcache.Acquire(ctx, userRoot, commitDir, false)
+	}
+	if err != nil {
 		return Result{}, err
 	}
-
-	temporaryRoot := filepath.Join(m.root, "tmp")
-	// The whole cache tree stays private to the current user.
-	if err := os.MkdirAll(temporaryRoot, 0o700); err != nil {
-		return Result{}, errors.Wrap(err, "create snapshot temporary directory")
+	success := false
+	defer func() {
+		if !success {
+			entry.Close()
+		}
+	}()
+	finish := func(hit bool, skipped int) (Result, error) {
+		if err := entry.Share(); err != nil {
+			return Result{}, err
+		}
+		success = true
+		return Result{Dir: final, CacheHit: hit, SkippedEntries: skipped, Release: func() { entry.Close() }}, nil
+	}
+	if info, err := os.Stat(final); err == nil && info.IsDir() {
+		return finish(true, 0)
+	}
+	m.sweepStaleTemporaries(userRoot)
+	budget := diskcache.Budget{Root: userRoot, MaxBytes: m.eviction.MaxBytes, TTL: m.eviction.TTL}
+	if err := budget.MakeRoom(1); err != nil {
+		return Result{}, err
+	}
+	temporaryRoot := filepath.Join(userRoot, ".tmp")
+	if err := os.MkdirAll(temporaryRoot, 0700); err != nil {
+		return Result{}, err
 	}
 	temporary, err := os.MkdirTemp(temporaryRoot, "snapshot-")
 	if err != nil {
-		return Result{}, errors.Wrap(err, "create snapshot temporary directory")
-	}
-
-	stats, err := extractArchive(ctx, download, filepath.Join(temporary, "snapshot"), m.limits)
-	if err == nil {
-		err = writeMetadata(temporary, key, instanceHash, stats)
-	}
-	if err != nil {
-		_ = os.RemoveAll(temporary)
 		return Result{}, err
 	}
-
-	// Only the parent of the final directory is created here. The rename
-	// below must land on a path that does not exist yet, because os.Rename
-	// does not replace existing directories on Linux; if a concurrent process
-	// published the same snapshot first, the rename fails and the published
-	// copy is adopted below.
-	if err := os.MkdirAll(filepath.Dir(commitDir), 0o700); err != nil {
-		_ = os.RemoveAll(temporary)
-		return Result{}, errors.Wrap(err, "create snapshot cache directory")
+	defer func() { _ = os.RemoveAll(temporary) }()
+	budget.Keep = temporary
+	stats, err := extractArchive(ctx, download, filepath.Join(temporary, "snapshot"), m.limits, budget.Reserve)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := writeMetadata(temporary, key, instanceHash, stats, budget.Reserve); err != nil {
+		return Result{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(commitDir), 0700); err != nil {
+		return Result{}, err
 	}
 	if err := os.Rename(temporary, commitDir); err != nil {
-		// Another process published the same snapshot first.
-		if info, statErr := os.Stat(final); statErr == nil && info.IsDir() {
-			_ = os.RemoveAll(temporary)
-			return Result{Dir: final, CacheHit: true, SkippedEntries: stats.SkippedEntries, Release: m.retain(commitDir)}, nil
-		}
-		_ = os.RemoveAll(temporary)
-		return Result{}, errors.Wrap(err, "publish snapshot directory")
+		return Result{}, err
 	}
-	return Result{Dir: final, SkippedEntries: stats.SkippedEntries, Release: m.retain(commitDir)}, nil
+	return finish(false, stats.SkippedEntries)
 }
 
-func writeMetadata(directory string, key Key, instanceHash string, stats extractionStats) error {
+func writeMetadata(directory string, key Key, instanceHash string, stats extractionStats, admit ...func(int64) error) error {
 	now := time.Now().UTC()
 	document, err := json.MarshalIndent(Metadata{
 		SchemaVersion:  metadataSchemaVersion,
@@ -227,6 +245,11 @@ func writeMetadata(directory string, key Key, instanceHash string, stats extract
 	}, "", "  ")
 	if err != nil {
 		return errors.Wrap(err, "encode snapshot metadata")
+	}
+	if len(admit) > 0 {
+		if err := admit[0](int64(len(document) + 1)); err != nil {
+			return err
+		}
 	}
 	target := filepath.Join(directory, "metadata.json")
 	// Metadata is written last so that a crash never leaves a published
@@ -337,18 +360,22 @@ func isCacheComponent(value string) bool {
 
 // sweepStaleTemporaries removes leftover extraction directories from processes
 // that died mid-extraction. Published snapshots are never touched.
-func (m *Manager) sweepStaleTemporaries() {
-	entries, err := os.ReadDir(filepath.Join(m.root, "tmp"))
-	if err != nil {
-		return
-	}
-	stale := time.Now().Add(-time.Hour)
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil || info.ModTime().After(stale) {
+func (m *Manager) sweepStaleTemporaries(userRoot string) {
+	// Ensure holds this user's writer lock, so no extraction in this namespace
+	// can still be running. Retain legacy cleanup for pre-migration leftovers.
+	for _, root := range []string{filepath.Join(userRoot, ".tmp"), filepath.Join(m.root, "tmp")} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(m.root, "tmp", entry.Name()))
+		stale := time.Now().Add(-time.Hour)
+		for _, entry := range entries {
+			info, err := entry.Info()
+			if err != nil || info.ModTime().After(stale) {
+				continue
+			}
+			_ = os.RemoveAll(filepath.Join(root, entry.Name()))
+		}
 	}
 }
 
@@ -359,7 +386,7 @@ type extractionStats struct {
 	TotalBytes     int64
 }
 
-func extractArchive(ctx context.Context, download func(context.Context) (io.ReadCloser, error), destination string, limits Limits) (extractionStats, error) {
+func extractArchive(ctx context.Context, download func(context.Context) (io.ReadCloser, error), destination string, limits Limits, admit ...func(int64) error) (extractionStats, error) {
 	if download == nil {
 		return extractionStats{}, errors.New("archive download is required")
 	}
@@ -423,6 +450,15 @@ func extractArchive(ctx context.Context, download func(context.Context) (io.Read
 				return extractionStats{}, errors.Wrap(err, "create snapshot directory")
 			}
 			continue
+		}
+		if len(admit) > 0 {
+			growth := header.Size
+			if info, err := os.Stat(target); err == nil {
+				growth = max(0, growth-info.Size())
+			}
+			if err := admit[0](growth); err != nil {
+				return extractionStats{}, err
+			}
 		}
 		written, err := writeFile(target, reader)
 		if err != nil {
@@ -537,3 +573,6 @@ func (b *boundedReader) Read(buffer []byte) (int, error) {
 	b.count += int64(read)
 	return read, err
 }
+
+// UserRoot returns the shared snapshot and Git cache namespace.
+func (m *Manager) UserRoot(userID int64) (string, error) { return m.userRoot(userID) }

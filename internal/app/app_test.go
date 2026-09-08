@@ -304,7 +304,8 @@ func TestCacheCleanRemovesCurrentUserCache(t *testing.T) {
 	for _, entry := range remaining {
 		userDirs = append(userDirs, entry.Name())
 	}
-	assert.Equal(t, []string{"22"}, userDirs, "only the authenticated user's cache is removed")
+	assert.Equal(t, []string{"21", "22"}, userDirs)
+	assertOnlyCacheLocks(t, filepath.Join(instance, "21"))
 }
 
 func TestCacheCleanAllRemovesVerifiedRootsOnly(t *testing.T) {
@@ -326,7 +327,8 @@ func TestCacheCleanAllRemovesVerifiedRootsOnly(t *testing.T) {
 	assert.Equal(t, exitOK, exitCode)
 
 	_, err := os.Stat(instance)
-	assert.True(t, os.IsNotExist(err), "the verified instance root must be removed")
+	require.NoError(t, err)
+	assertOnlyCacheLocks(t, filepath.Join(instance, "21"))
 	_, err = os.Stat(filepath.Join(cacheRoot, "keep.txt"))
 	require.NoError(t, err, "unrelated files must survive")
 	_, err = os.Stat(filepath.Join(cacheRoot, "tmp"))
@@ -675,7 +677,8 @@ func TestCacheCleanRemovesNamedUserCache(t *testing.T) {
 	for _, entry := range remaining {
 		userDirs = append(userDirs, entry.Name())
 	}
-	assert.Equal(t, []string{"22"}, userDirs, "only the named user's snapshot cache is removed")
+	assert.Equal(t, []string{"21", "22"}, userDirs)
+	assertOnlyCacheLocks(t, filepath.Join(instance, "21"))
 }
 
 func TestCacheCleanWithoutCredentialsNeedsSelector(t *testing.T) {
@@ -703,4 +706,12 @@ func TestVerifyWithoutTokenGivesClearDiagnostic(t *testing.T) {
 	require.NotNil(t, result.Error)
 	assert.Equal(t, "CONFIG_INVALID", result.Error.Code)
 	assert.Contains(t, result.Error.Message, "Gogs token")
+}
+
+func assertOnlyCacheLocks(t *testing.T, root string) {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "cleanup should remove every payload while retaining the lock namespace")
+	assert.Equal(t, ".locks", entries[0].Name())
 }

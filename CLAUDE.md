@@ -43,10 +43,11 @@ task test:e2e          # 全部场景
 
 请求路径:`cmd/gogs-mcp`(薄 main)→ `internal/app`(CLI 分发 serve/verify/cache/version 与退出码)→ stdio 走 `internal/mcpserver`、http 走 `internal/httpserver`(两者都基于 modelcontextprotocol/go-sdk)→ `internal/gogs`(Gogs v0.14.2 REST 客户端)。
 
-- `internal/httpserver` — Streamable HTTP 传输:认证中间件从配置的 header 提取每请求 token(`auth.go`),按 `sha256(token)` 在 LRU+TTL 用户缓存里解析出隔离的用户级 `mcpserver.Server`(`users.go`,缓存根下 `users/<userID>` 子目录隔离磁盘),访问日志绝不读取凭据 header(`log.go`);共享 `mcp.SchemaCache` 消除 stateless 每请求的 schema 反射开销。
+- `internal/httpserver` — Streamable HTTP 传输:认证中间件从配置的 header 提取每请求 token(`auth.go`),按 `sha256(token)` 在 LRU+TTL 用户缓存里解析出隔离的用户级 `mcpserver.Server`(`users.go`,有效期从认证成功计时，命中不续期；数据按 `<instance-hash>/<userID>` 隔离),访问日志绝不读取凭据 header(`log.go`);共享 `mcp.SchemaCache` 消除 stateless 每请求的 schema 反射开销。
 - `internal/mcpserver` — 按域注册工具:`repositories.go`、`contents.go`、`git.go`、`search.go`、`issues.go`。`server.go` 中的 `Client` 接口由 `*gogs.Client` 满足(消费方定义接口);新增工具时需同时扩展该接口与 `internal/gogs` 客户端。
 - `internal/gogs` — HTTP 客户端与错误分类。`errors.go` 把传输错误与 HTTP 状态映射为稳定错误码(如 404 → `RESOURCE_NOT_FOUND_OR_FORBIDDEN`,不泄漏资源存在性);写操作的传输失败映射为 `WRITE_OUTCOME_UNKNOWN`。
 - `internal/config` — 环境变量 + 可选 JSON 配置文件,环境变量优先;token 文件权限宽于 0600 即拒绝;`GOGS_TOKEN` 与 `GOGS_TOKEN_FILE` 互斥;纯 HTTP 必须显式 `GOGS_ALLOW_INSECURE_HTTP=true`。
+- `internal/diskcache` — 快照与 PR Git 共用每用户容量预算，写前预留，`.locks` 文件锁协调跨客户端/进程读写和清理。
 - `internal/snapshot` — `search_code` 的 tar.gz 归档快照缓存:按用户/仓库/commit 缓存,LRU + TTL 淘汰(`eviction.go`),解包时跳过 symlink/hardlink/device 并拒绝路径穿越。
 - `internal/securelog` — slog JSON handler,把 token 出现处替换为 `[REDACTED]`;`Writer` 串行化共享目的地,`NewRedactingLogger` 为每用户持独立脱敏表(HTTP 传输下每个用户只脱敏自己的 token)。日志只写 stderr;HTTP 传输下也是唯一的日志目的地。
 - `internal/packagegen` + `cmd/mkpackage` — 离线包元数据(SBOM、第三方许可、MANIFEST.sha256、SOURCE-METADATA.json);Taskfile 负责其余打包步骤,并注入 `internal/version` 的 ldflags。

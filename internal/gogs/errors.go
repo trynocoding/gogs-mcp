@@ -22,6 +22,7 @@ const (
 	CodeGogsError                   ErrorCode = "GOGS_ERROR"
 	CodeTLSError                    ErrorCode = "TLS_ERROR"
 	CodeTimeout                     ErrorCode = "TIMEOUT"
+	CodeCanceled                    ErrorCode = "REQUEST_CANCELLED"
 	CodeResponseTooLarge            ErrorCode = "RESPONSE_TOO_LARGE"
 	CodeInvalidArgument             ErrorCode = "INVALID_ARGUMENT"
 	CodeArchiveUnsafe               ErrorCode = "ARCHIVE_UNSAFE"
@@ -48,14 +49,14 @@ func (e *Error) Unwrap() error {
 }
 
 func AsError(err error) *Error {
-	var gogsError *Error
-	if errors.As(err, &gogsError) {
-		return gogsError
+	var classified *Error
+	if errors.As(err, &classified) {
+		return classified
 	}
-	return &Error{
-		Code:    CodeInternal,
-		Message: "An internal error occurred.",
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return classifyTransportError(err)
 	}
+	return &Error{Code: CodeInternal, Message: "An internal error occurred."}
 }
 
 // classifyWriteTransportError classifies a failed POST request. A dial or
@@ -79,6 +80,9 @@ func classifyWriteTransportError(err error) *Error {
 }
 
 func classifyTransportError(err error) *Error {
+	if errors.Is(err, context.Canceled) {
+		return &Error{Code: CodeCanceled, Message: "The request was cancelled.", cause: err}
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &Error{
 			Code:      CodeTimeout,

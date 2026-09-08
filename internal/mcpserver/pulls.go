@@ -23,16 +23,19 @@ const (
 )
 
 type listPullRequestsInput struct {
-	Owner string `json:"owner"`
-	Repo  string `json:"repo"`
-	State string `json:"state,omitempty"`
-	Limit int    `json:"limit,omitempty"`
+	Owner  string `json:"owner"`
+	Repo   string `json:"repo"`
+	State  string `json:"state,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
+	Before int64  `json:"before,omitempty"`
 }
 
 type getPullRequestInput struct {
-	Owner  string `json:"owner"`
-	Repo   string `json:"repo"`
-	Number int64  `json:"number"`
+	BodyOffset   int    `json:"body_offset,omitempty"`
+	BodyMaxBytes int    `json:"body_max_bytes,omitempty"`
+	Owner        string `json:"owner"`
+	Repo         string `json:"repo"`
+	Number       int64  `json:"number"`
 }
 
 type getPullRequestDiffInput struct {
@@ -57,7 +60,7 @@ func registerPullTools(server *mcp.Server, client Client) {
 			state = gogs.PullStateOpen
 		}
 		ctx = gogs.WithRequestMetadata(ctx, requestID, "list_pull_requests")
-		pulls, total, err := client.ListPullRequests(ctx, input.Owner, input.Repo, state, input.Limit)
+		pulls, total, next, err := client.ListPullRequests(ctx, input.Owner, input.Repo, state, input.Limit, input.Before)
 		if err != nil {
 			result, response := contentError[PullRequestPage](requestID, err)
 			return result, response, nil
@@ -68,8 +71,9 @@ func registerPullTools(server *mcp.Server, client Client) {
 				State:        state,
 				Limit:        limitOrDefault(input.Limit, defaultPullLimitShared),
 				Total:        total,
+				TotalScope:   "all_advertised_refs",
 			},
-			Meta: ResponseMeta{RequestID: requestID},
+			Meta: ResponseMeta{RequestID: requestID, Truncated: next > 0, NextBefore: next},
 		}, nil
 	})
 
@@ -86,10 +90,16 @@ func registerPullTools(server *mcp.Server, client Client) {
 			result, response := contentError[PullRequest](requestID, err)
 			return result, response, nil
 		}
+		if err := validateBodyOffset(pull.Body, input.BodyOffset); err != nil {
+			result, response := contentError[PullRequest](requestID, err)
+			return result, response, nil
+		}
 		output := mapPullRequest(pull)
+		meta := ResponseMeta{RequestID: requestID}
+		boundBody(&output.Body, input.BodyOffset, input.BodyMaxBytes, &meta)
 		return nil, ToolResponse[PullRequest]{
 			Data: &output,
-			Meta: ResponseMeta{RequestID: requestID},
+			Meta: meta,
 		}, nil
 	})
 
@@ -233,12 +243,15 @@ func listPullRequestsInputSchema() *jsonschema.Schema {
 		Description: "Pull request state to list: open, closed, or all. Defaults to open.",
 		Enum:        []any{"open", "closed", "all"},
 	}
+	properties["before"] = integerSchema("Continue with PR numbers below meta.next_before; keep the same state filter.", 1, 0)
+	properties["before"].Default = nil
 	properties["limit"] = integerSchema("Maximum number of pull requests to return, from 1 through 100.", defaultPullLimitShared, maximumPullLimitShared)
 	return objectSchema(properties, []string{"owner", "repo"})
 }
 
 func getPullRequestInputSchema() *jsonschema.Schema {
 	properties := repositoryIdentityProperties()
+	bodyRangeProperties(properties)
 	properties["number"] = integerSchema("Pull request number.", 1, 0)
 	return objectSchema(properties, []string{"owner", "repo", "number"})
 }

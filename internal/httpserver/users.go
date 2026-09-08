@@ -61,7 +61,6 @@ func (c *userCache) get(hash string) (*userEntry, bool) {
 		c.remove(entry)
 		return nil, false
 	}
-	entry.expiresAt = time.Now().Add(c.ttl)
 	c.order.MoveToFront(entry.element)
 	return entry, true
 }
@@ -228,8 +227,8 @@ func (s *Server) buildUser(ctx context.Context, token, hash string) (*userEntry,
 }
 
 // buildUserEntry assembles the per-user Gogs client, logger, and tool
-// server. The pull request cache lives under cacheRoot/users/<userID> so
-// that users never share extracted content, matching the snapshot cache.
+// server. This legacy client root is retained for cache maintenance compatibility;
+// the snapshot manager supplies the shared per-instance, per-user payload root.
 // The whole fixed chain is private to the server process (0700): MkdirAll
 // creates missing ancestors with that mode, but directories an older
 // version created keep their looser mode, so every ancestor is tightened as
@@ -251,6 +250,7 @@ func (s *Server) buildUserEntry(token, hash string, user gogs.User) (*userEntry,
 	if err != nil {
 		return nil, err
 	}
+	client.SetAuthenticationFailureHandler(func() { s.users.invalidate(hash); s.invalid.add(hash) })
 	server := mcpserver.New(client, s.options.Snapshots, logger, s.options.SearchDefaults, s.options.WriteEnabled, mcpserver.WithSchemaCache(s.schemas))
 	// The user cache sets the expiry clock on put.
 	return &userEntry{
@@ -263,4 +263,12 @@ func (s *Server) buildUserEntry(token, hash string, user gogs.User) (*userEntry,
 func tokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+func (c *userCache) invalidate(hash string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry := c.entries[hash]; entry != nil {
+		c.remove(entry)
+	}
 }

@@ -6,8 +6,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-
-	"github.com/cockroachdb/errors"
+	"time"
 )
 
 // Pull request listing limits shared with the tool layer.
@@ -81,57 +80,64 @@ type PullRequestDiff struct {
 
 // ListPullRequests returns the most recent pull requests of a repository in
 // the given state, newest first, together with the total number of pull
-// request heads the repository currently advertises. Every listed entry
-// costs one issue lookup, so the result is bounded by limit rather than
-// paged: Gogs v0.14.2 has no server-side pull request listing.
-func (c *Client) ListPullRequests(ctx context.Context, owner, repo, state string, limit int) ([]PullRequestSummary, int, error) {
-	switch state {
-	case PullStateOpen, PullStateClosed, PullStateAll:
-	default:
-		return nil, 0, &Error{
-			Code:    CodeInvalidArgument,
-			Message: "The state must be one of open, closed, or all.",
-		}
+// request heads the repository currently advertises and a continuation cursor.
+// Each call examines at most 100 issue records, including filtered entries.
+func (c *Client) ListPullRequests(ctx context.Context, owner, repo, state string, limit int, before int64) ([]PullRequestSummary, int, int64, error) {
+	if state != PullStateOpen && state != PullStateClosed && state != PullStateAll {
+		return nil, 0, 0, &Error{Code: CodeInvalidArgument, Message: "The state must be open, closed, or all."}
+	}
+	if before < 0 {
+		return nil, 0, 0, &Error{Code: CodeInvalidArgument, Message: "before must be a positive PR number."}
 	}
 	if limit <= 0 {
 		limit = defaultPullLimit
 	}
 	limit = min(limit, maximumPullLimit)
-
+	timeout := c.http.Timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	refs, err := c.listPullRefs(ctx, owner, repo)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
+	return c.scanPullRefs(ctx, owner, repo, state, limit, before, refs)
+}
 
+// scanPullRefs uses the last examined number as a stable continuation boundary,
+// even when filtering returns no matches. Each call reads at most 100 issues.
+func (c *Client) scanPullRefs(ctx context.Context, owner, repo, state string, limit int, before int64, refs []PullRef) ([]PullRequestSummary, int, int64, error) {
 	summaries := make([]PullRequestSummary, 0, limit)
-	// refs arrive in ascending order; walk them backwards so the newest
-	// pull requests come first.
-	for index := len(refs) - 1; index >= 0 && len(summaries) < limit; index-- {
+	scanned := 0
+	var next int64
+	for index := len(refs) - 1; index >= 0; index-- {
 		ref := refs[index]
-		issue, err := c.GetIssue(ctx, owner, repo, ref.Number)
-		var notFound *Error
-		if errors.As(err, &notFound) && notFound.Code == CodeResourceNotFoundOrForbidden {
-			// The ref outlived its issue or is not visible to the token.
+		if before > 0 && ref.Number >= before {
 			continue
 		}
+		if scanned >= 100 || len(summaries) >= limit {
+			return summaries, len(refs), next, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, 0, 0, classifyTransportError(err)
+		}
+		scanned++
+		next = ref.Number
+		issue, err := c.GetIssue(ctx, owner, repo, ref.Number)
 		if err != nil {
-			return nil, 0, err
+			if AsError(err).Code == CodeResourceNotFoundOrForbidden {
+				continue
+			}
+			return nil, 0, 0, err
 		}
 		if state != PullStateAll && issue.State != state {
 			continue
 		}
-		summaries = append(summaries, PullRequestSummary{
-			Number:      issue.Number,
-			Title:       issue.Title,
-			State:       issue.State,
-			User:        issue.User,
-			NumComments: issue.NumComments,
-			CreatedAt:   issue.CreatedAt,
-			UpdatedAt:   issue.UpdatedAt,
-			HeadSHA:     ref.HeadSHA,
-		})
+		summaries = append(summaries, PullRequestSummary{Number: issue.Number, Title: issue.Title, State: issue.State, User: issue.User, NumComments: issue.NumComments, CreatedAt: issue.CreatedAt, UpdatedAt: issue.UpdatedAt, HeadSHA: ref.HeadSHA})
 	}
-	return summaries, len(refs), nil
+	return summaries, len(refs), 0, nil
 }
 
 // GetPullRequest returns one pull request by number. A missing or
@@ -207,6 +213,7 @@ func (c *Client) GetPullRequestDiff(ctx context.Context, owner, repo string, num
 		return PullRequestDiff{}, err
 	}
 	diff, err := engine.DiffPull(ctx, c.gitCloneURL(owner, repo), number, baseRef, paths, maxBytes)
+	c.invalidateAuthentication(err)
 	if err != nil {
 		return PullRequestDiff{}, err
 	}
@@ -243,7 +250,9 @@ func (c *Client) listPullRefs(ctx context.Context, owner, repo string) ([]PullRe
 	if err != nil {
 		return nil, err
 	}
-	return engine.ListPullRefs(ctx, c.gitCloneURL(owner, repo))
+	refs, err := engine.ListPullRefs(ctx, c.gitCloneURL(owner, repo))
+	c.invalidateAuthentication(err)
+	return refs, err
 }
 
 // pullHeadRef resolves the refs/pull/{number}/head entry of one pull
@@ -287,10 +296,19 @@ func (c *Client) pullEngine(ctx context.Context) (*PullEngine, error) {
 	if err != nil {
 		return nil, err
 	}
+	cacheDir := c.cacheDir
+	if c.snapshots != nil {
+		cacheDir, err = c.snapshots.UserRoot(user.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	engine, err := NewPullEngine(PullEngineOptions{
-		CacheDir:      c.cacheDir,
+		CacheDir:      cacheDir,
 		Username:      user.Username,
 		Token:         c.token,
+		CABundle:      c.caBundle,
+		Timeout:       c.http.Timeout,
 		CacheTTL:      c.cacheTTL,
 		CacheMaxBytes: c.cacheMaxBytes,
 		Logger:        c.logger,

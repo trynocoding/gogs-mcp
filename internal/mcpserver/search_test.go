@@ -325,10 +325,10 @@ func TestSearchCodeNoSnapshotFilesEscapeCacheRoot(t *testing.T) {
 	require.Len(t, response.Data.Matches, 1)
 	assert.Equal(t, "sub/file.txt", response.Data.Matches[0].Path)
 
-	// The cache root contains only the instance hash and temporary directory.
+	// Temporary data stays within the instance/user namespace.
 	entries, err := os.ReadDir(root)
 	require.NoError(t, err)
-	assert.Len(t, entries, 2)
+	assert.Len(t, entries, 1)
 }
 
 // multiFileArchive returns a download callback serving a Gogs-style archive

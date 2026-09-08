@@ -11,7 +11,7 @@ type Tag struct {
 type tagResponse struct {
 	Name   string `json:"name"`
 	Commit *struct {
-		SHA string `json:"sha"`
+		ID string `json:"id"`
 	} `json:"commit"`
 }
 
@@ -26,7 +26,7 @@ func (c *Client) ListTags(ctx context.Context, owner, repo string) ([]Tag, error
 	for index, entry := range response {
 		tags[index] = Tag{Name: entry.Name}
 		if entry.Commit != nil {
-			tags[index].CommitSHA = entry.Commit.SHA
+			tags[index].CommitSHA = entry.Commit.ID
 		}
 	}
 	return tags, nil

@@ -246,6 +246,7 @@ func (s *Server) newClient(token, cacheDir string, logger *slog.Logger) (*gogs.C
 		Timeout:       s.options.HTTPTimeout,
 		UserAgent:     s.options.UserAgent,
 		CacheDir:      cacheDir,
+		Snapshots:     s.options.Snapshots,
 		CacheTTL:      s.options.CacheTTL,
 		CacheMaxBytes: s.options.CacheMaxBytes,
 		Logger:        logger,

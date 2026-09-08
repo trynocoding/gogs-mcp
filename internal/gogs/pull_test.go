@@ -14,7 +14,7 @@ import (
 func TestListPullRequestsRejectsUnknownStateBeforeAnyRequest(t *testing.T) {
 	// An empty client must never be touched: the state check runs first.
 	client := &Client{}
-	_, _, err := client.ListPullRequests(context.Background(), "owner", "calculator", "merged", 30)
+	_, _, _, err := client.ListPullRequests(context.Background(), "owner", "calculator", "merged", 30, 0)
 	require.Error(t, err)
 	assert.Equal(t, CodeInvalidArgument, AsError(err).Code)
 }

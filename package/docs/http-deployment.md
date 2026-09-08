@@ -103,14 +103,14 @@ and do not cache any response of the MCP endpoint.
 
 Disk use grows with the number of active users: every user gets an
 isolated snapshot and pull request cache subtree under
-`GOGS_MCP_CACHE_DIR/users/<userID>`, each bounded by
+`GOGS_MCP_CACHE_DIR/<instance-hash>/<userID>/`, jointly bounded by
 `GOGS_MCP_CACHE_MAX_BYTES` (2 GiB by default) and `GOGS_MCP_CACHE_TTL`
-(24 hours). A busy deployment with hundreds of users should lower the
+(24 hours). Temporary extraction and Git writes count toward this shared budget. Cross-process locks live on the same writable cache volume; cleanup retains empty lock files and refuses active entries. A busy deployment with hundreds of users should lower the
 per-user bound or provision disk accordingly.
 
 The resolved-user cache keeps at most `GOGS_MCP_HTTP_MAX_USERS` users in
 memory (128 by default) and evicts the least recently used ones;
-eviction only drops the in-memory client, not the on-disk cache.
+eviction only drops the in-memory client, not the on-disk cache. Authentication TTL is measured from validation, not extended on cache hits; a downstream authentication failure invalidates the cached client immediately.
 
 Reclaim disk with:
 
